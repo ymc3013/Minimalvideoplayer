@@ -13,27 +13,22 @@ jobs:
     container: devkitpro/devkitarm:latest
 
     steps:
-      - name: Get repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Check development environment
         shell: bash
         run: |
           set -euo pipefail
-
-          test -n "${DEVKITPRO:-}"
-          test -n "${DEVKITARM:-}"
+          echo "DEVKITPRO=$DEVKITPRO"
+          echo "DEVKITARM=$DEVKITARM"
           test -x "$DEVKITARM/bin/arm-none-eabi-gcc"
           test -f "$DEVKITARM/3ds_rules"
 
-          echo "DEVKITPRO=$DEVKITPRO"
-          echo "DEVKITARM=$DEVKITARM"
-
-      - name: Generate project files
+      - name: Generate project
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p source
 
           cat > source/main.c <<'EOF'
@@ -46,17 +41,14 @@ jobs:
               consoleInit(GFX_TOP, NULL);
 
               printf("DualScreenVideoPlayer\n");
-              printf("=====================\n\n");
               printf("Build test successful.\n");
               printf("Press START to exit.\n");
 
               while (aptMainLoop())
               {
                   hidScanInput();
-
                   if (hidKeysDown() & KEY_START)
                       break;
-
                   gspWaitForVBlank();
               }
 
@@ -73,12 +65,12 @@ jobs:
           SOURCES := source
           INCLUDES :=
 
-          ARCH := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
+          ARCH := -march=armv6k -mtune=mpcore -mfloat-abi=hard
 
           CFLAGS := -g -Wall -Wextra -O2 -mword-relocations
           CFLAGS += -ffunction-sections -fdata-sections $(ARCH)
 
-          LDFLAGS := -specs=3dsx.specs -g $(ARCH)
+          LDFLAGS := -specs=3dsx.specs
           LDFLAGS += -Wl,--gc-sections
 
           LIBS := -lctru
@@ -89,24 +81,18 @@ jobs:
           all: $(BUILD)/$(TARGET).3dsx
           EOF
 
-          echo "Project generated successfully."
-          find source -maxdepth 1 -type f -print
-
       - name: Compile
         shell: bash
         run: |
           set -euo pipefail
           make
 
-      - name: Verify application
+      - name: Verify output
         shell: bash
         run: |
           set -euo pipefail
-
           find . -type f -name '*.3dsx' -print
           test -s build/DualScreenVideoPlayer.3dsx
-
-          echo "Application generated successfully."
 
       - name: Upload application
         uses: actions/upload-artifact@v4
