@@ -21,8 +21,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Checking devkitPro environment..."
-
           test -n "${DEVKITPRO:-}"
           test -n "${DEVKITARM:-}"
           test -x "$DEVKITARM/bin/arm-none-eabi-gcc"
@@ -30,9 +28,8 @@ jobs:
 
           echo "DEVKITPRO=$DEVKITPRO"
           echo "DEVKITARM=$DEVKITARM"
-          "$DEVKITARM/bin/arm-none-eabi-gcc" --version
 
-      - name: Generate project
+      - name: Generate project files
         shell: bash
         run: |
           set -euo pipefail
@@ -87,18 +84,18 @@ jobs:
           LIBS := -lctru
 
           include $(DEVKITARM)/3ds_rules
+
+          .PHONY: all
+          all: $(BUILD)/$(TARGET).3dsx
           EOF
 
-          echo "Generated files:"
+          echo "Project generated successfully."
           find source -maxdepth 1 -type f -print
-          test -s source/main.c
-          test -s Makefile
 
       - name: Compile
         shell: bash
         run: |
           set -euo pipefail
-          make clean
           make
 
       - name: Verify application
@@ -106,18 +103,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Searching for the 3DS application..."
           find . -type f -name '*.3dsx' -print
-
-          test -s DualScreenVideoPlayer.3dsx
+          test -s build/DualScreenVideoPlayer.3dsx
 
           echo "Application generated successfully."
-          ls -lh DualScreenVideoPlayer.3dsx
 
       - name: Upload application
         uses: actions/upload-artifact@v4
         with:
           name: DualScreenVideoPlayer-3DSX
-          path: DualScreenVideoPlayer.3dsx
+          path: build/DualScreenVideoPlayer.3dsx
           if-no-files-found: error
           retention-days: 14
