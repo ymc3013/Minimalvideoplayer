@@ -1,0 +1,123 @@
+name: DualScreenVideoPlayer
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm:latest
+
+    steps:
+      - name: Get repository
+        uses: actions/checkout@v4
+
+      - name: Check development environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking devkitPro environment..."
+
+          test -n "${DEVKITPRO:-}"
+          test -n "${DEVKITARM:-}"
+          test -x "$DEVKITARM/bin/arm-none-eabi-gcc"
+          test -f "$DEVKITARM/3ds_rules"
+
+          echo "DEVKITPRO=$DEVKITPRO"
+          echo "DEVKITARM=$DEVKITARM"
+          "$DEVKITARM/bin/arm-none-eabi-gcc" --version
+
+      - name: Generate project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p source
+
+          cat > source/main.c <<'EOF'
+          #include <3ds.h>
+          #include <stdio.h>
+
+          int main(void)
+          {
+              gfxInitDefault();
+              consoleInit(GFX_TOP, NULL);
+
+              printf("DualScreenVideoPlayer\n");
+              printf("=====================\n\n");
+              printf("Build test successful.\n");
+              printf("Press START to exit.\n");
+
+              while (aptMainLoop())
+              {
+                  hidScanInput();
+
+                  if (hidKeysDown() & KEY_START)
+                      break;
+
+                  gspWaitForVBlank();
+              }
+
+              gfxExit();
+              return 0;
+          }
+          EOF
+
+          cat > Makefile <<'EOF'
+          .DEFAULT_GOAL := all
+
+          TARGET := DualScreenVideoPlayer
+          BUILD := build
+          SOURCES := source
+          INCLUDES :=
+
+          ARCH := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
+
+          CFLAGS := -g -Wall -Wextra -O2 -mword-relocations
+          CFLAGS += -ffunction-sections -fdata-sections $(ARCH)
+
+          LDFLAGS := -specs=3dsx.specs -g $(ARCH)
+          LDFLAGS += -Wl,--gc-sections
+
+          LIBS := -lctru
+
+          include $(DEVKITARM)/3ds_rules
+          EOF
+
+          echo "Generated files:"
+          find source -maxdepth 1 -type f -print
+          test -s source/main.c
+          test -s Makefile
+
+      - name: Compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          make clean
+          make
+
+      - name: Verify application
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Searching for the 3DS application..."
+          find . -type f -name '*.3dsx' -print
+
+          test -s DualScreenVideoPlayer.3dsx
+
+          echo "Application generated successfully."
+          ls -lh DualScreenVideoPlayer.3dsx
+
+      - name: Upload application
+        uses: actions/upload-artifact@v4
+        with:
+          name: DualScreenVideoPlayer-3DSX
+          path: DualScreenVideoPlayer.3dsx
+          if-no-files-found: error
+          retention-days: 14
