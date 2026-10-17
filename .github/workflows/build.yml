@@ -39,10 +39,9 @@ jobs:
           test -f upstream/Makefile
           test -f upstream/source/main.c
           test -f upstream/source/video_player.c
-          test -f upstream/source/system/menu.c
           test -f upstream/include/video_player.h
 
-      - name: Patch C sources automatically
+      - name: Patch player for automatic playback
         shell: bash
         run: |
           set -eu
@@ -52,70 +51,32 @@ jobs:
           import re
 
           root = Path("upstream")
-
-          def replace_once(path, old, new):
-              text = path.read_text()
-              if old not in text:
-                  raise SystemExit(
-                      f"Patch failed: expected code not found in {path}"
-                  )
-              path.write_text(text.replace(old, new, 1))
-
-          # 1. Replace the original menu-driven entry point.
-          main_c = r'''#include <stdbool.h>
-          #include <stdint.h>
-
-          #include "3ds.h"
-          #include "system/menu.h"
-          #include "video_player.h"
-
-          int main(void)
-          {
-              Menu_init();
-
-              /*
-               * Initialize the original decoding engine without its
-               * initialization screen. The patched engine queues the
-               * automatic playback request during initialization.
-               */
-              Vid_init(false);
-
-              while (aptMainLoop())
-              {
-                  Vid_main();
-              }
-
-              Menu_exit();
-              return 0;
-          }
-          '''
-          (root / "source/main.c").write_text(main_c)
-
-          # 2. Force full-screen mode and turn off the bottom screen.
           player = root / "source/video_player.c"
+
           text = player.read_text()
 
-          def patch_function(source, function_name, edits):
+          def patch_function(source, name, edits):
               pattern = (
-                  r'(static void ' + re.escape(function_name) +
+                  r'(static void ' + re.escape(name) +
                   r'\(void\)\s*\{.*?\n\})'
               )
               match = re.search(pattern, source, re.S)
               if not match:
                   raise SystemExit(
-                      f"Patch failed: function {function_name} not found"
+                      f"Could not locate function: {name}"
                   )
 
               body = match.group(1)
               for old, new in edits:
                   if old not in body:
                       raise SystemExit(
-                          f"Patch failed inside {function_name}: {old!r}"
+                          f"Expected code missing in {name}: {old}"
                       )
                   body = body.replace(old, new, 1)
 
               return source[:match.start()] + body + source[match.end():]
 
+          # Hide the controls and enable full-screen mode.
           text = patch_function(
               text,
               "Vid_init_ui_data",
@@ -128,10 +89,14 @@ jobs:
                       "vid_player.turn_off_bottom_screen_count = 0;",
                       "vid_player.turn_off_bottom_screen_count = 1;"
                   ),
+                  (
+                      "vid_player.menu_mode = MENU_CONTROLS;",
+                      "vid_player.menu_mode = MENU_MAX;"
+                  ),
               ],
           )
 
-          # Do not display the original full-screen instruction overlay.
+          # Do not show the full-screen instruction overlay.
           text = patch_function(
               text,
               "Vid_init_hidden_settings",
@@ -143,10 +108,14 @@ jobs:
               ],
           )
 
-          # 3. Queue a real playback request using the engine's own
-          #    Vid_file structure and decoder command queue.
+          # Queue playback only after the engine has initialized.
+          marker = (
+              '\tVid_resume();\n\n'
+              '\tDEF_LOG_STRING("Initialized.");'
+          )
+
           autoplay = r'''
-              // MinimalVideoPlayer: automatic playback.
+              // MinimalVideoPlayer: play the configured AVI automatically.
               Vid_file *auto_file = malloc(sizeof(Vid_file));
 
               if (auto_file)
@@ -160,7 +129,7 @@ jobs:
                            "%s", "test.avi");
                   auto_file->index = 0;
 
-                  uint32_t auto_play_result = Util_queue_add(
+                  uint32_t play_result = Util_queue_add(
                       &vid_player.decode_thread_command_queue,
                       DECODE_THREAD_PLAY_REQUEST,
                       auto_file,
@@ -168,65 +137,66 @@ jobs:
                       QUEUE_OPTION_NONE
                   );
 
-                  if (auto_play_result != DEF_SUCCESS)
+                  if (play_result != DEF_SUCCESS)
                       free(auto_file);
               }
           '''
 
-          init_marker = (
-              '\tVid_resume();\n\n'
-              '\tDEF_LOG_STRING("Initialized.");'
-          )
-          init_replacement = (
-              '\tVid_resume();\n\n' +
-              autoplay +
-              '\n\tDEF_LOG_STRING("Initialized.");'
-          )
-          if init_marker not in text:
+          if marker not in text:
               raise SystemExit(
-                  "Patch failed: Vid_init completion marker not found"
+                  "Could not locate the end of Vid_init(). "
+                  "The upstream source may have changed."
               )
-          text = text.replace(init_marker, init_replacement, 1)
+
+          text = text.replace(
+              marker,
+              '\tVid_resume();\n' + autoplay +
+              '\n\tDEF_LOG_STRING("Initialized.");',
+              1
+          )
+
           player.write_text(text)
 
-          # 4. Disable playback-button input handling.
-          menu_c = root / "source/system/menu.c"
-          menu_text = menu_c.read_text()
+          # Replace main.c without running the original menu loop.
+          main_c = '''#include <stdbool.h>
+          #include <stdint.h>
+          #include "3ds.h"
+          #include "system/menu.h"
+          #include "video_player.h"
 
-          input_block = re.compile(
-              r'#ifdef DEF_VID_ENABLE\n'
-              r'\s*else if \(Vid_query_running_flag\(\)\)\n'
-              r'\s*Vid_hid\(&key\);\n'
-              r'\s*#endif //DEF_VID_ENABLE'
-          )
-          menu_text, count = input_block.subn(
-              '#ifdef DEF_VID_ENABLE\n'
-              '    else if (Vid_query_running_flag())\n'
-              '    {\n'
-              '        /* Playback input intentionally disabled. */\n'
-              '    }\n'
-              '#endif //DEF_VID_ENABLE',
-              menu_text,
-              count=1,
-          )
-          if count != 1:
-              raise SystemExit(
-                  "Patch failed: playback input block not found"
-              )
-          menu_c.write_text(menu_text)
+          int main(void)
+          {
+              Menu_init();
+              Vid_init(false);
 
-          # 5. Confirm that every required patch was applied.
-          assert '"sdmc:/Movies/"' in player.read_text()
-          assert '"test.avi"' in player.read_text()
-          assert "DECODE_THREAD_PLAY_REQUEST" in player.read_text()
-          assert "Vid_init(false);" in main_c
+              while (aptMainLoop())
+              {
+                  Vid_main();
+              }
 
-          print("Automatic-playback patches applied successfully.")
+              Vid_exit(false);
+              Menu_exit();
+              return 0;
+          }
+          '''
+
+          (root / "source/main.c").write_text(main_c)
+
+          # Verify the requested changes before compiling.
+          patched = player.read_text()
+
+          assert "DECODE_THREAD_PLAY_REQUEST" in patched
+          assert '"sdmc:/Movies/"' in patched
+          assert '"test.avi"' in patched
+          assert "vid_player.menu_mode = MENU_MAX;" in patched
+          assert "Menu_main();" not in main_c
+
+          print("Automatic-playback patch applied.")
           PYTHON
 
           python3 /tmp/patch_player.py
 
-      - name: Compile patched player
+      - name: Compile player
         shell: bash
         working-directory: upstream
         run: |
@@ -234,12 +204,10 @@ jobs:
           make clean
           make 3dsx
 
-          echo "Generated applications:"
           find . -maxdepth 2 -type f -name '*.3dsx' -print
-
           test -s upstream.3dsx
 
-      - name: Prepare final artifact
+      - name: Prepare artifact
         shell: bash
         run: |
           set -eu
@@ -247,7 +215,6 @@ jobs:
           cp upstream/upstream.3dsx \
             output/Minimalvideoplayer.3dsx
           test -s output/Minimalvideoplayer.3dsx
-          ls -lh output/Minimalvideoplayer.3dsx
 
       - name: Upload 3DSX
         uses: actions/upload-artifact@v4
