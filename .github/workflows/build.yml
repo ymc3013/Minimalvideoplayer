@@ -16,19 +16,25 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Check development environment
+      - name: Check toolchain
         shell: bash
         run: |
           set -euo pipefail
+
           echo "DEVKITPRO=$DEVKITPRO"
           echo "DEVKITARM=$DEVKITARM"
-          test -x "$DEVKITARM/bin/arm-none-eabi-gcc"
-          test -f "$DEVKITARM/3ds_rules"
 
-      - name: Generate project
+          test -x "$DEVKITARM/bin/arm-none-eabi-gcc"
+          command -v 3dsxtool
+          test -f "$DEVKITPRO/libctru/include/3ds.h"
+
+          "$DEVKITARM/bin/arm-none-eabi-gcc" --version
+
+      - name: Generate test application
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p source
 
           cat > source/main.c <<'EOF'
@@ -41,14 +47,17 @@ jobs:
               consoleInit(GFX_TOP, NULL);
 
               printf("DualScreenVideoPlayer\n");
-              printf("Build test successful.\n");
+              printf("=====================\n\n");
+              printf("Build successful!\n");
               printf("Press START to exit.\n");
 
               while (aptMainLoop())
               {
                   hidScanInput();
+
                   if (hidKeysDown() & KEY_START)
                       break;
+
                   gspWaitForVBlank();
               }
 
@@ -57,47 +66,44 @@ jobs:
           }
           EOF
 
-          cat > Makefile <<'EOF'
-          .DEFAULT_GOAL := all
-
-          TARGET := DualScreenVideoPlayer
-          BUILD := build
-          SOURCES := source
-          INCLUDES :=
-
-          ARCH := -march=armv6k -mtune=mpcore -mfloat-abi=hard
-
-          CFLAGS := -g -Wall -Wextra -O2 -mword-relocations
-          CFLAGS += -ffunction-sections -fdata-sections $(ARCH)
-
-          LDFLAGS := -specs=3dsx.specs
-          LDFLAGS += -Wl,--gc-sections
-
-          LIBS := -lctru
-
-          include $(DEVKITARM)/3ds_rules
-
-          .PHONY: all
-          all: $(BUILD)/$(TARGET).3dsx
-          EOF
-
-      - name: Compile
+      - name: Compile and link with ARM GCC
         shell: bash
         run: |
           set -euo pipefail
-          make
 
-      - name: Verify output
+          "$DEVKITARM/bin/arm-none-eabi-gcc" \
+            -g -O2 -Wall -Wextra \
+            -march=armv6k \
+            -mtune=mpcore \
+            -mfloat-abi=hard \
+            -mtp=soft \
+            -mword-relocations \
+            -ffunction-sections \
+            -fdata-sections \
+            -D__3DS__ \
+            -I"$DEVKITPRO/libctru/include" \
+            -specs=3dsx.specs \
+            -Wl,--gc-sections \
+            source/main.c \
+            -L"$DEVKITPRO/libctru/lib" \
+            -lctru -lm \
+            -o DualScreenVideoPlayer.elf
+
+      - name: Create 3DSX
         shell: bash
         run: |
           set -euo pipefail
-          find . -type f -name '*.3dsx' -print
-          test -s build/DualScreenVideoPlayer.3dsx
+
+          3dsxtool DualScreenVideoPlayer.elf \
+            DualScreenVideoPlayer.3dsx
+
+          test -s DualScreenVideoPlayer.3dsx
+          ls -lh DualScreenVideoPlayer.3dsx
 
       - name: Upload application
         uses: actions/upload-artifact@v4
         with:
           name: DualScreenVideoPlayer-3DSX
-          path: build/DualScreenVideoPlayer.3dsx
+          path: DualScreenVideoPlayer.3dsx
           if-no-files-found: error
           retention-days: 14
