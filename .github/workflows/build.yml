@@ -4,8 +4,6 @@ name: Minimalvideoplayer Build
 on:
   push:
   workflow_dispatch:
-  schedule:
-    - cron: "0 6 * * 1"
 
 permissions:
   contents: read
@@ -14,82 +12,56 @@ jobs:
   build:
     name: Build Nintendo 3DS application
     runs-on: ubuntu-latest
-
     container:
       image: devkitpro/devkitarm:latest
 
     steps:
-      - name: Checkout Minimalvideoplayer
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install required build tools
+      - name: Check build tools
         shell: bash
         run: |
           set -eu
-
-          echo "Checking devkitPro environment..."
-          test -n "${DEVKITPRO:-}"
-          test -n "${DEVKITARM:-}"
           test -f "$DEVKITARM/3ds_rules"
-
-          command -v make
           command -v git
+          command -v make
 
-          echo "Toolchain found."
-
-      - name: Clone upstream video player
+      - name: Clone upstream player
         shell: bash
         run: |
           set -eu
-
           git clone --depth 1 \
             https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
             upstream
-
           test -f upstream/Makefile
-          test -f upstream/source/main.c
-          test -d upstream/library/include
-          test -d upstream/library/lib
 
-      - name: Check graphics tools
-        shell: bash
-        run: |
-          set -eu
-
-          if ! command -v tex3ds >/dev/null 2>&1; then
-            echo "::error::tex3ds is missing from the build environment."
-            exit 1
-          fi
-
-      - name: Compile upstream 3DSX
+      - name: Compile upstream player
         shell: bash
         working-directory: upstream
         run: |
           set -eu
-
           make clean
           make 3dsx
 
-          test -s Video_player_for_3DS.3dsx
+          echo "Generated 3DSX files:"
+          find . -maxdepth 2 -type f -name '*.3dsx' -print
 
-      - name: Prepare download
+          test -s upstream.3dsx
+
+      - name: Prepare artifact
         shell: bash
         run: |
           set -eu
-
           mkdir -p output
-
-          cp upstream/Video_player_for_3DS.3dsx \
+          cp upstream/upstream.3dsx \
             output/Minimalvideoplayer.3dsx
+          ls -lh output/Minimalvideoplayer.3dsx
 
-          cp upstream/LICENSE output/LICENSE-GPL-3.0
-
-          ls -lh output/
-
-      - name: Upload compiled application
+      - name: Upload 3DSX
         uses: actions/upload-artifact@v4
         with:
           name: Minimalvideoplayer-3DSX
-          path: output/
+          path: output/Minimalvideoplayer.3dsx
           if-no-files-found: error
           retention-days: 14
