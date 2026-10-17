@@ -1,109 +1,95 @@
-name: DualScreenVideoPlayer
+
+name: Minimalvideoplayer Build
 
 on:
   push:
   workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"
 
 permissions:
   contents: read
 
 jobs:
   build:
+    name: Build Nintendo 3DS application
     runs-on: ubuntu-latest
-    container: devkitpro/devkitarm:latest
+
+    container:
+      image: devkitpro/devkitarm:latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Minimalvideoplayer
         uses: actions/checkout@v4
 
-      - name: Check toolchain
+      - name: Install required build tools
         shell: bash
         run: |
-          set -euo pipefail
+          set -eu
 
-          echo "DEVKITPRO=$DEVKITPRO"
-          echo "DEVKITARM=$DEVKITARM"
+          echo "Checking devkitPro environment..."
+          test -n "${DEVKITPRO:-}"
+          test -n "${DEVKITARM:-}"
+          test -f "$DEVKITARM/3ds_rules"
 
-          test -x "$DEVKITARM/bin/arm-none-eabi-gcc"
-          command -v 3dsxtool
-          test -f "$DEVKITPRO/libctru/include/3ds.h"
+          command -v make
+          command -v git
 
-          "$DEVKITARM/bin/arm-none-eabi-gcc" --version
+          echo "Toolchain found."
 
-      - name: Generate test application
+      - name: Clone upstream video player
         shell: bash
         run: |
-          set -euo pipefail
+          set -eu
 
-          mkdir -p source
+          git clone --depth 1 \
+            https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
+            upstream
 
-          cat > source/main.c <<'EOF'
-          #include <3ds.h>
-          #include <stdio.h>
+          test -f upstream/Makefile
+          test -f upstream/source/main.c
+          test -d upstream/library/include
+          test -d upstream/library/lib
 
-          int main(void)
-          {
-              gfxInitDefault();
-              consoleInit(GFX_TOP, NULL);
-
-              printf("DualScreenVideoPlayer\n");
-              printf("=====================\n\n");
-              printf("Build successful!\n");
-              printf("Press START to exit.\n");
-
-              while (aptMainLoop())
-              {
-                  hidScanInput();
-
-                  if (hidKeysDown() & KEY_START)
-                      break;
-
-                  gspWaitForVBlank();
-              }
-
-              gfxExit();
-              return 0;
-          }
-          EOF
-
-      - name: Compile and link with ARM GCC
+      - name: Check graphics tools
         shell: bash
         run: |
-          set -euo pipefail
+          set -eu
 
-          "$DEVKITARM/bin/arm-none-eabi-gcc" \
-            -g -O2 -Wall -Wextra \
-            -march=armv6k \
-            -mtune=mpcore \
-            -mfloat-abi=hard \
-            -mtp=soft \
-            -mword-relocations \
-            -ffunction-sections \
-            -fdata-sections \
-            -D__3DS__ \
-            -I"$DEVKITPRO/libctru/include" \
-            -specs=3dsx.specs \
-            -Wl,--gc-sections \
-            source/main.c \
-            -L"$DEVKITPRO/libctru/lib" \
-            -lctru -lm \
-            -o DualScreenVideoPlayer.elf
+          if ! command -v tex3ds >/dev/null 2>&1; then
+            echo "::error::tex3ds is missing from the build environment."
+            exit 1
+          fi
 
-      - name: Create 3DSX
+      - name: Compile upstream 3DSX
+        shell: bash
+        working-directory: upstream
+        run: |
+          set -eu
+
+          make clean
+          make 3dsx
+
+          test -s Video_player_for_3DS.3dsx
+
+      - name: Prepare download
         shell: bash
         run: |
-          set -euo pipefail
+          set -eu
 
-          3dsxtool DualScreenVideoPlayer.elf \
-            DualScreenVideoPlayer.3dsx
+          mkdir -p output
 
-          test -s DualScreenVideoPlayer.3dsx
-          ls -lh DualScreenVideoPlayer.3dsx
+          cp upstream/Video_player_for_3DS.3dsx \
+            output/Minimalvideoplayer.3dsx
 
-      - name: Upload application
+          cp upstream/LICENSE output/LICENSE-GPL-3.0
+
+          ls -lh output/
+
+      - name: Upload compiled application
         uses: actions/upload-artifact@v4
         with:
-          name: DualScreenVideoPlayer-3DSX
-          path: DualScreenVideoPlayer.3dsx
+          name: Minimalvideoplayer-3DSX
+          path: output/
           if-no-files-found: error
           retention-days: 14
