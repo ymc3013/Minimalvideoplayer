@@ -1,5 +1,5 @@
 
-name: MinimalVideoPlayer - Automatic Build
+name: MinimalVideoPlayer - Autonomous Build
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    name: Build automatic AVI player
+    name: Build autonomous 3DS application
     runs-on: ubuntu-latest
     container:
       image: devkitpro/devkitarm:latest
@@ -26,197 +26,187 @@ jobs:
           test -x "$DEVKITARM/bin/arm-none-eabi-gcc"
           command -v make
           command -v git
-          command -v python3
 
-      - name: Download original video engine
+      - name: Get decoder libraries only
         shell: bash
         run: |
           set -eu
           git clone --depth 1 \
             https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
-            upstream
+            /tmp/decoder-deps
 
-          test -f upstream/Makefile
-          test -f upstream/source/main.c
-          test -f upstream/source/video_player.c
-          test -f upstream/include/video_player.h
+          test -d /tmp/decoder-deps/library/include
+          test -d /tmp/decoder-deps/library/lib
 
-      - name: Patch player for automatic playback
+          mkdir -p source library
+          cp -a /tmp/decoder-deps/library/include library/
+          cp -a /tmp/decoder-deps/library/lib library/
+
+          # Copy the toolchain Makefile as a build template.
+          cp /tmp/decoder-deps/Makefile ./Makefile
+
+      - name: Generate autonomous source
         shell: bash
         run: |
           set -eu
 
-          cat > /tmp/patch_player.py <<'PYTHON'
-          from pathlib import Path
-          import re
+          cat > source/main.c <<'EOF'
+          #include <stdio.h>
+          #include <string.h>
 
-          root = Path("upstream")
-          player = root / "source/video_player.c"
+          #include <3ds.h>
+          #include <libavformat/avformat.h>
+          #include <libavcodec/avcodec.h>
 
-          text = player.read_text()
-
-          def patch_function(source, name, edits):
-              pattern = (
-                  r'(static void ' + re.escape(name) +
-                  r'\(void\)\s*\{.*?\n\})'
-              )
-              match = re.search(pattern, source, re.S)
-              if not match:
-                  raise SystemExit(
-                      f"Could not locate function: {name}"
-                  )
-
-              body = match.group(1)
-              for old, new in edits:
-                  if old not in body:
-                      raise SystemExit(
-                          f"Expected code missing in {name}: {old}"
-                      )
-                  body = body.replace(old, new, 1)
-
-              return source[:match.start()] + body + source[match.end():]
-
-          # Hide the controls and enable full-screen mode.
-          text = patch_function(
-              text,
-              "Vid_init_ui_data",
-              [
-                  (
-                      "vid_player.is_full_screen = false;",
-                      "vid_player.is_full_screen = true;"
-                  ),
-                  (
-                      "vid_player.turn_off_bottom_screen_count = 0;",
-                      "vid_player.turn_off_bottom_screen_count = 1;"
-                  ),
-                  (
-                      "vid_player.menu_mode = MENU_CONTROLS;",
-                      "vid_player.menu_mode = MENU_MAX;"
-                  ),
-              ],
-          )
-
-          # Do not show the full-screen instruction overlay.
-          text = patch_function(
-              text,
-              "Vid_init_hidden_settings",
-              [
-                  (
-                      "vid_player.show_full_screen_msg = true;",
-                      "vid_player.show_full_screen_msg = false;"
-                  ),
-              ],
-          )
-
-          # Queue playback only after the engine has initialized.
-          marker = (
-              '\tVid_resume();\n\n'
-              '\tDEF_LOG_STRING("Initialized.");'
-          )
-
-          autoplay = r'''
-              // MinimalVideoPlayer: play the configured AVI automatically.
-              Vid_file *auto_file = malloc(sizeof(Vid_file));
-
-              if (auto_file)
-              {
-                  memset(auto_file, 0, sizeof(*auto_file));
-                  snprintf(auto_file->directory,
-                           sizeof(auto_file->directory),
-                           "%s", "sdmc:/Movies/");
-                  snprintf(auto_file->name,
-                           sizeof(auto_file->name),
-                           "%s", "test.avi");
-                  auto_file->index = 0;
-
-                  uint32_t play_result = Util_queue_add(
-                      &vid_player.decode_thread_command_queue,
-                      DECODE_THREAD_PLAY_REQUEST,
-                      auto_file,
-                      QUEUE_OP_TIMEOUT_US,
-                      QUEUE_OPTION_NONE
-                  );
-
-                  if (play_result != DEF_SUCCESS)
-                      free(auto_file);
-              }
-          '''
-
-          if marker not in text:
-              raise SystemExit(
-                  "Could not locate the end of Vid_init(). "
-                  "The upstream source may have changed."
-              )
-
-          text = text.replace(
-              marker,
-              '\tVid_resume();\n' + autoplay +
-              '\n\tDEF_LOG_STRING("Initialized.");',
-              1
-          )
-
-          player.write_text(text)
-
-          # Replace main.c without running the original menu loop.
-          main_c = '''#include <stdbool.h>
-          #include <stdint.h>
-          #include "3ds.h"
-          #include "system/menu.h"
-          #include "video_player.h"
+          #define VIDEO_PATH "sdmc:/Movies/test.avi"
 
           int main(void)
           {
-              Menu_init();
-              Vid_init(false);
+              gfxInitDefault();
+              consoleInit(GFX_TOP, NULL);
 
-              while (aptMainLoop())
-              {
-                  Vid_main();
+              printf("MinimalVideoPlayer\n");
+              printf("Autonomous decoder test\n\n");
+              printf("File: %s\n\n", VIDEO_PATH);
+
+              AVFormatContext *format = NULL;
+              int result = avformat_open_input(
+                  &format, VIDEO_PATH, NULL, NULL
+              );
+
+              if (result < 0) {
+                  printf("ERROR: cannot open AVI.\n");
+                  printf("Check sdmc:/Movies/test.avi\n");
+                  goto wait_exit;
               }
 
-              Vid_exit(false);
-              Menu_exit();
+              result = avformat_find_stream_info(format, NULL);
+              if (result < 0) {
+                  printf("ERROR: cannot read AVI streams.\n");
+                  avformat_close_input(&format);
+                  goto wait_exit;
+              }
+
+              int video_index = -1;
+              int audio_index = -1;
+
+              for (unsigned int i = 0; i < format->nb_streams; i++) {
+                  AVCodecParameters *p = format->streams[i]->codecpar;
+
+                  if (p->codec_type == AVMEDIA_TYPE_VIDEO)
+                      video_index = (int)i;
+
+                  if (p->codec_type == AVMEDIA_TYPE_AUDIO)
+                      audio_index = (int)i;
+              }
+
+              printf("AVI opened successfully.\n");
+
+              if (video_index >= 0) {
+                  AVCodecParameters *p =
+                      format->streams[video_index]->codecpar;
+                  const AVCodec *decoder =
+                      avcodec_find_decoder(p->codec_id);
+
+                  printf("Video: %dx%d\n", p->width, p->height);
+                  printf("Video codec: %s\n",
+                      decoder ? decoder->name : "unsupported");
+              } else {
+                  printf("No video stream found.\n");
+              }
+
+              if (audio_index >= 0) {
+                  AVCodecParameters *p =
+                      format->streams[audio_index]->codecpar;
+                  const AVCodec *decoder =
+                      avcodec_find_decoder(p->codec_id);
+
+                  printf("Audio codec: %s\n",
+                      decoder ? decoder->name : "unsupported");
+              } else {
+                  printf("No audio stream found.\n");
+              }
+
+              printf("\nDecoder library check complete.\n");
+              printf("This build does not render video or play audio yet.\n");
+
+              avformat_close_input(&format);
+
+          wait_exit:
+              printf("\nPress START to exit.");
+
+              while (aptMainLoop()) {
+                  hidScanInput();
+
+                  if (hidKeysDown() & KEY_START)
+                      break;
+
+                  gfxFlushBuffers();
+                  gfxSwapBuffers();
+                  gspWaitForVBlank();
+              }
+
+              gfxExit();
               return 0;
           }
-          '''
+          EOF
 
-          (root / "source/main.c").write_text(main_c)
-
-          # Verify the requested changes before compiling.
-          patched = player.read_text()
-
-          assert "DECODE_THREAD_PLAY_REQUEST" in patched
-          assert '"sdmc:/Movies/"' in patched
-          assert '"test.avi"' in patched
-          assert "vid_player.menu_mode = MENU_MAX;" in patched
-          assert "Menu_main();" not in main_c
-
-          print("Automatic-playback patch applied.")
-          PYTHON
-
-          python3 /tmp/patch_player.py
-
-      - name: Compile player
+      - name: Configure our own application
         shell: bash
-        working-directory: upstream
         run: |
           set -eu
-          make clean
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("Makefile")
+          s = p.read_text()
+
+          s = s.replace(
+              "TARGET\t\t:=\t$(notdir $(CURDIR))",
+              "TARGET\t\t:=\tMinimalvideoplayer"
+          )
+          s = s.replace(
+              "SOURCES\t\t:=\tsource source/system source/system/util source/system/draw",
+              "SOURCES\t\t:=\tsource"
+          )
+          s = s.replace(
+              "INCLUDES\t:=\tinclude library/include",
+              "INCLUDES\t:=\tlibrary/include"
+          )
+          s = s.replace(
+              "DATA\t\t:=\tdata",
+              "DATA\t\t:=\tdata"
+          )
+          s = s.replace(
+              "APP_TITLE\t\t\t:= Video player for 3DS",
+              "APP_TITLE\t\t\t:= MinimalVideoPlayer"
+          )
+          s = s.replace(
+              "APP_DESCRIPTION\t\t:= Video player for 3DS v1.8.0",
+              "APP_DESCRIPTION\t\t:= Autonomous AVI decoder test"
+          )
+          s = s.replace(
+              "APP_AUTHOR\t\t\t:= Core_2_Extreme",
+              "APP_AUTHOR\t\t\t:= ymc3013"
+          )
+
+          p.write_text(s)
+          PY
+
+      - name: Compile
+        shell: bash
+        run: |
+          set -eu
+          make clean || true
           make 3dsx
 
-          find . -maxdepth 2 -type f -name '*.3dsx' -print
-          test -s upstream.3dsx
-
-      - name: Prepare artifact
-        shell: bash
-        run: |
-          set -eu
+          test -s Minimalvideoplayer.3dsx
           mkdir -p output
-          cp upstream/upstream.3dsx \
-            output/Minimalvideoplayer.3dsx
-          test -s output/Minimalvideoplayer.3dsx
+          cp Minimalvideoplayer.3dsx output/
+          ls -lh output/
 
-      - name: Upload 3DSX
+      - name: Upload application
         uses: actions/upload-artifact@v4
         with:
           name: Minimalvideoplayer-3DSX
