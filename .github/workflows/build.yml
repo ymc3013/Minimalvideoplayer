@@ -15,17 +15,32 @@ jobs:
       - name: Set up devkitPro
         uses: devkitPro/setup-devkitpro@v1
 
-      - name: Install ARM toolchain and zlib
+      - name: Install toolchain and system libraries
         run: |
           sudo dkp-pacman -Sy --noconfirm
-          sudo dkp-pacman -S --noconfirm devkitARM arm-none-eabi-zlib
+          sudo dkp-pacman -S --noconfirm devkitARM libctru citro2d citro3d arm-none-eabi-zlib
 
-      - name: Export environment
+      - name: Disable bundled libctru if present
+        run: |
+          BUNDLED="third_party/decoder/lib/libctru.a"
+          DISABLED="third_party/decoder/lib/libctru.a.disabled"
+
+          if [ -e "$DISABLED" ]; then
+            echo "Unexpected leftover $DISABLED"
+            exit 1
+          fi
+
+          if [ -f "$BUNDLED" ]; then
+            echo "Disabling bundled libctru: $BUNDLED -> $DISABLED"
+            mv "$BUNDLED" "$DISABLED"
+          fi
+
+      - name: Export DEVKIT env
         run: |
           echo "DEVKITPRO=/opt/devkitpro" >> $GITHUB_ENV
           echo "DEVKITARM=/opt/devkitpro/devkitARM" >> $GITHUB_ENV
 
-      - name: Build the 3DS app
+      - name: Build
         env:
           DEVKITPRO: ${{ env.DEVKITPRO }}
           DEVKITARM: ${{ env.DEVKITARM }}
