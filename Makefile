@@ -1,21 +1,33 @@
+.SUFFIXES:
+
+ifeq ($(strip $(DEVKITPRO)),)
+$(error DEVKITPRO is not set)
+endif
+
+ifeq ($(strip $(DEVKITARM)),)
+$(error DEVKITARM is not set)
+endif
+
 TARGET      := Minimalvideoplayer
 BUILD       := build
 SOURCES     := source
-INCLUDES    := include
+INCLUDES    := include library/include
+LIBDIRS     := library/lib
 
 ARCH        := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 
-CFLAGS      := -g -Wall -O2 -mword-relocations -ffunction-sections $(ARCH)
-CFLAGS      += -D__3DS__ -I$(DEVKITPRO)/portlibs/3ds/include
+CFLAGS      := -O2 -Wall -ffunction-sections -fdata-sections $(ARCH)
+CFLAGS      += -D__3DS__
 CXXFLAGS    := $(CFLAGS) -fno-rtti -fno-exceptions
-LDFLAGS     := -specs=3dsx.specs -g $(ARCH) -Wl,--gc-sections
+LDFLAGS     := -specs=3dsx.specs $(ARCH) -Wl,--gc-sections
 
-LIBS        := -lctru -lavformat -lavcodec -lswresample -lswscale -lavutil -lm -lz
-LIBDIRS     := $(DEVKITPRO)/portlibs/3ds/lib
+LIBS        := -lswresample -lavformat -lswscale -lavcodec -lavutil
+LIBS        += -lx264 -lmp3lame -ldav1d
+LIBS        += -lctru -lz -lm
 
 APP_TITLE       := Minimal Video Player
-APP_DESCRIPTION := Automatic AVI video player
+APP_DESCRIPTION := Automatic AVI Player
 APP_AUTHOR      := ymc3013
+NO_SMDH         := 1
 
-include $(DEVKITPRO)/libctru/default_icon.png
 include $(DEVKITARM)/3ds_rules
