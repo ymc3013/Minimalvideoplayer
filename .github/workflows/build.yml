@@ -14,36 +14,32 @@ jobs:
       image: devkitpro/devkitarm:latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare FFmpeg libraries
+      - name: Prepare dependencies
         shell: bash
         run: |
           set -eux
-
           git clone --depth 1 \
             https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
-            /tmp/3ds-reference
+            /tmp/reference
 
           mkdir -p library/include library/lib build
-
-          cp -a /tmp/3ds-reference/library/include/. library/include/
-          cp -a /tmp/3ds-reference/library/lib/. library/lib/
+          cp -a /tmp/reference/library/include/. library/include/
+          cp -a /tmp/reference/library/lib/. library/lib/
           rm -f library/lib/libctru.a
 
-      - name: Generate Makefile
+      - name: Generate correct Makefile
         shell: bash
         run: |
           set -eux
-
           cat > Makefile <<'MAKEFILE'
-          .DEFAULT_GOAL := all
-
           TARGET := Minimalvideoplayer
           BUILD := build
           SOURCES := source
           INCLUDES := include library/include
+          LIBDIRS := library/lib
 
           ARCH := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 
@@ -53,29 +49,22 @@ jobs:
           ASFLAGS := $(ARCH)
           LDFLAGS := -specs=3dsx.specs $(ARCH) -Wl,--gc-sections
 
-          LIBDIRS := library/lib
           LIBS := -lswresample -lavformat -lswscale -lavcodec -lavutil
           LIBS += -lx264 -lmp3lame -ldav1d -lz -lm -lctru
 
           APP_TITLE := Minimal Video Player
           APP_DESCRIPTION := Automatic AVI Player
           APP_AUTHOR := ymc3013
-          APP_ICON := $(DEVKITPRO)/libctru/default_icon.png
 
-          .PHONY: all clean
-          all:
-          	$(MAKE) --no-print-directory -f $(DEVKITARM)/3ds_rules
-
-          clean:
-          	rm -rf $(BUILD) $(TARGET).elf $(TARGET).3dsx $(TARGET).smdh
-
-          include $(DEVKITARM)/3ds_rules
+          include $(DEVKITPRO)/devkitARM/3ds_rules
           MAKEFILE
 
-          # Remove the incorrect recursive target if present in the generated file.
-          # The actual devkitPro rules are included at the end of this Makefile.
+          if grep -q '$(MAKE).*3ds_rules' Makefile; then
+            echo "Invalid recursive Makefile detected"
+            exit 1
+          fi
 
-      - name: Build application
+      - name: Build
         shell: bash
         run: |
           set -eux
@@ -87,7 +76,7 @@ jobs:
       - name: Verify output
         run: test -s Minimalvideoplayer.3dsx
 
-      - name: Upload application
+      - name: Upload 3DSX
         uses: actions/upload-artifact@v4
         with:
           name: Minimalvideoplayer-3DS
