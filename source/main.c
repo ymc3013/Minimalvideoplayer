@@ -34,6 +34,11 @@
 #include <libavutil/channel_layout.h>
 #include <libavutil/samplefmt.h>
 #include <libavutil/mathematics.h>
+#include <libavutil/error.h>
+#include <libavutil/log.h>
+#include <libavformat/avio.h>
+#include <stdarg.h>
+#include <errno.h>
 
 #define SCR_W 400
 #define SCR_H 240
@@ -92,6 +97,76 @@ typedef struct {
     bool      paused;
     bool      quit;
 } Ctx;
+
+/* ------------------------------------------------------------------ logging / diagnostics */
+
+static FILE *g_log;   /* sdmc:/3ds/minivideo_log.txt */
+
+static void say(const char *f, ...)
+{
+    char b[512];
+    va_list v;
+    va_start(v, f);
+    vsnprintf(b, sizeof(b), f, v);
+    va_end(v);
+    fputs(b, stdout);
+    if (g_log) { fputs(b, g_log); fflush(g_log); }
+}
+
+/* FFmpeg's own messages: INFO and below go to the log file, WARNING and below also to the screen */
+static void av_log_cb(void *ptr, int level, const char *fmt, va_list vl)
+{
+    (void)ptr;
+    if (level > AV_LOG_INFO) return;
+    char line[512];
+    vsnprintf(line, sizeof(line), fmt, vl);
+    if (g_log) { fputs(line, g_log); fflush(g_log); }
+    if (level <= AV_LOG_WARNING) fputs(line, stdout);
+}
+
+static void check_ffmpeg_build(void)
+{
+    unsigned rf = avformat_version(), rc = avcodec_version(), ru = avutil_version();
+    unsigned rs = swscale_version(), rr = swresample_version();
+    say("FFmpeg runtime: avformat %u.%u avcodec %u.%u avutil %u.%u\n",
+        rf >> 16, (rf >> 8) & 255, rc >> 16, (rc >> 8) & 255, ru >> 16, (ru >> 8) & 255);
+
+#define CHK_VER(name, rt, hdr) \
+    if (((rt) >> 8) != ((unsigned)(hdr) >> 8)) \
+        say("WARNING %s: headers %u.%u != library %u.%u (struct layouts may differ!)\n", name, \
+            (unsigned)(hdr) >> 16, ((unsigned)(hdr) >> 8) & 255, (rt) >> 16, ((rt) >> 8) & 255)
+    CHK_VER("avformat",   rf, LIBAVFORMAT_VERSION_INT);
+    CHK_VER("avcodec",    rc, LIBAVCODEC_VERSION_INT);
+    CHK_VER("avutil",     ru, LIBAVUTIL_VERSION_INT);
+    CHK_VER("swscale",    rs, LIBSWSCALE_VERSION_INT);
+    CHK_VER("swresample", rr, LIBSWRESAMPLE_VERSION_INT);
+#undef CHK_VER
+
+    const AVInputFormat *avi = av_find_input_format("avi");
+    say("demuxer 'avi': %s\n", avi ? "present" : "MISSING from this FFmpeg build");
+
+    bool has_file = false;
+    void *op = NULL;
+    const char *pn;
+    while ((pn = avio_enum_protocols(&op, 0))) if (!strcmp(pn, "file")) has_file = true;
+    say("protocol 'file': %s\n", has_file ? "present" : "MISSING from this FFmpeg build");
+
+    if (g_log) fprintf(g_log, "FFmpeg configure line: %s\n", avformat_configuration());
+}
+
+static const char *explain_err(int r)
+{
+    switch (r) {
+    case AVERROR_PROTOCOL_NOT_FOUND: return "protocol not found (URL scheme unknown or 'file' protocol not built in)";
+    case AVERROR_DEMUXER_NOT_FOUND:  return "no demuxer for this data (not built in?)";
+    case AVERROR_INVALIDDATA:        return "data not recognised / corrupt (not a valid AVI, or truncated)";
+    case AVERROR(ENOENT):            return "file not found";
+    case AVERROR(EIO):               return "I/O error while reading";
+    case AVERROR(ENOMEM):            return "out of memory";
+    case AVERROR(EACCES):            return "permission denied";
+    default:                         return "see message above";
+    }
+}
 
 /* ------------------------------------------------------------------ input / pause */
 
@@ -385,16 +460,151 @@ static bool find_avi(const char *dir, char *out, size_t cap)
 
 static AVCodecContext *open_decoder(AVStream *st)
 {
+    char err[AV_ERROR_MAX_STRING_SIZE];
     const AVCodec *codec = avcodec_find_decoder(st->codecpar->codec_id);
-    if (!codec) return NULL;
+    if (!codec) {
+        say("No decoder compiled in for '%s'\n", avcodec_get_name(st->codecpar->codec_id));
+        return NULL;
+    }
     AVCodecContext *ctx = avcodec_alloc_context3(codec);
     if (!ctx) return NULL;
-    if (avcodec_parameters_to_context(ctx, st->codecpar) < 0 ||
-        avcodec_open2(ctx, codec, NULL) < 0) {
+    int r = avcodec_parameters_to_context(ctx, st->codecpar);
+    if (r < 0) {
+        say("avcodec_parameters_to_context failed: %d (%s)\n", r, av_make_error_string(err, sizeof(err), r));
+        avcodec_free_context(&ctx);
+        return NULL;
+    }
+    r = avcodec_open2(ctx, codec, NULL);
+    if (r < 0) {
+        say("avcodec_open2('%s') failed: %d (%s)\n", codec->name, r, av_make_error_string(err, sizeof(err), r));
         avcodec_free_context(&ctx);
         return NULL;
     }
     return ctx;
+}
+
+/* ------------------------------------------------------------------ opening the media */
+
+/*
+ * Why two attempts:
+ * FFmpeg decides which protocol to use by parsing the text before the first ':' of the URL.
+ * For "sdmc:/videos/test.avi" it reads "sdmc" as a URL scheme and looks for a protocol
+ * named "sdmc", which does not exist -> AVERROR_PROTOCOL_NOT_FOUND. Prefixing "file:" forces
+ * the 'file' protocol, which then hands "sdmc:/videos/test.avi" to open().
+ * If the build has no 'file' protocol at all, attempt 2 reads through stdio via a custom
+ * AVIOContext, which does not depend on any protocol being compiled in.
+ */
+static FILE         *g_fp;
+static AVIOContext  *g_pb;
+
+static int io_read(void *opaque, uint8_t *buf, int size)
+{
+    (void)opaque;
+    size_t n = fread(buf, 1, (size_t)size, g_fp);
+    if (n == 0) return feof(g_fp) ? AVERROR_EOF : AVERROR(EIO);
+    return (int)n;
+}
+
+static int64_t io_seek(void *opaque, int64_t off, int whence)
+{
+    (void)opaque;
+    if (whence & AVSEEK_SIZE) {
+        long cur = ftell(g_fp);
+        if (fseek(g_fp, 0, SEEK_END) != 0) return -1;
+        long sz = ftell(g_fp);
+        fseek(g_fp, cur, SEEK_SET);
+        return sz;
+    }
+    whence &= ~AVSEEK_FORCE;
+    if (whence != SEEK_SET && whence != SEEK_CUR && whence != SEEK_END) return -1;
+    if (fseek(g_fp, (long)off, whence) != 0) return -1;
+    return ftell(g_fp);
+}
+
+static void close_media(Ctx *c)
+{
+    if (c->fmt) avformat_close_input(&c->fmt);   /* does not free a custom pb */
+    if (g_pb) { av_freep(&g_pb->buffer); avio_context_free(&g_pb); }
+    if (g_fp) { fclose(g_fp); g_fp = NULL; }
+}
+
+static bool open_media(Ctx *c, const char *path)
+{
+    char err[AV_ERROR_MAX_STRING_SIZE];
+    char url[600];
+    int r;
+
+    /* ---- attempt 1: normal protocol layer, forced to 'file:' */
+    snprintf(url, sizeof(url), "file:%s", path);
+    say("[1/3] avformat_open_input via protocol: %s\n", url);
+    c->fmt = NULL;
+    r = avformat_open_input(&c->fmt, url, NULL, NULL);
+    if (r >= 0) {
+        say("[1/3] OK (protocol layer)\n");
+    } else {
+        say("[1/3] FAILED avformat_open_input: %d = %s -> %s\n", r,
+            av_make_error_string(err, sizeof(err), r), explain_err(r));
+        c->fmt = NULL;
+
+        /* ---- attempt 2: custom AVIOContext over stdio */
+        say("[1/3] retrying with custom AVIOContext (stdio)\n");
+        g_fp = fopen(path, "rb");
+        if (!g_fp) {
+            say("fopen('%s') FAILED: errno=%d (%s)\n", path, errno, strerror(errno));
+            return false;
+        }
+        fseek(g_fp, 0, SEEK_END);
+        long fsize = ftell(g_fp);
+        fseek(g_fp, 0, SEEK_SET);
+        unsigned char hdr[12] = {0};
+        size_t hn = fread(hdr, 1, sizeof(hdr), g_fp);
+        fseek(g_fp, 0, SEEK_SET);
+        say("file size: %ld bytes; first 12 bytes: '%.4s' ... '%.4s'\n",
+            fsize, hn >= 4 ? (const char *)hdr : "?", hn >= 12 ? (const char *)hdr + 8 : "?");
+        if (hn < 12 || memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "AVI ", 4) != 0)
+            say("WARNING: header is not RIFF....AVI  -> this file is not a standard AVI "
+                "(renamed MP4/MKV, OpenDML 'AVIX' only, or truncated copy)\n");
+
+        const int bufsz = 32768;
+        unsigned char *iobuf = (unsigned char *)av_malloc(bufsz);
+        if (!iobuf) { say("av_malloc failed\n"); close_media(c); return false; }
+        g_pb = avio_alloc_context(iobuf, bufsz, 0, NULL, io_read, NULL, io_seek);
+        if (!g_pb) { av_free(iobuf); say("avio_alloc_context failed\n"); close_media(c); return false; }
+
+        c->fmt = avformat_alloc_context();
+        if (!c->fmt) { say("avformat_alloc_context failed\n"); close_media(c); return false; }
+        c->fmt->pb = g_pb;
+        c->fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+
+        r = avformat_open_input(&c->fmt, path, NULL, NULL);
+        if (r < 0) {
+            say("[1/3] FAILED avformat_open_input (custom AVIO): %d = %s -> %s\n", r,
+                av_make_error_string(err, sizeof(err), r), explain_err(r));
+            c->fmt = NULL;               /* freed by avformat_open_input on failure */
+            close_media(c);
+            return false;
+        }
+        say("[1/3] OK (custom AVIOContext)\n");
+    }
+    say("container detected: %s (%s)\n", c->fmt->iformat->name, c->fmt->iformat->long_name);
+
+    /* ---- step 2: stream analysis, checked separately */
+    say("[2/3] avformat_find_stream_info...\n");
+    r = avformat_find_stream_info(c->fmt, NULL);
+    if (r < 0) {
+        say("[2/3] FAILED avformat_find_stream_info: %d = %s -> %s\n", r,
+            av_make_error_string(err, sizeof(err), r), explain_err(r));
+        close_media(c);
+        return false;
+    }
+    say("[2/3] OK: %u stream(s), duration %.1f s\n", c->fmt->nb_streams,
+        c->fmt->duration != AV_NOPTS_VALUE ? c->fmt->duration / (double)AV_TIME_BASE : -1.0);
+    for (unsigned i = 0; i < c->fmt->nb_streams; i++) {
+        const AVCodecParameters *p = c->fmt->streams[i]->codecpar;
+        say("  stream %u: %s %s\n", i, av_get_media_type_string(p->codec_type),
+            avcodec_get_name(p->codec_id));
+    }
+    return true;
 }
 
 /* ------------------------------------------------------------------ main */
@@ -411,6 +621,11 @@ int main(void)
     consoleInit(GFX_BOTTOM, NULL);
     osSetSpeedupEnable(true);                      /* ignored on Old 3DS */
 
+    g_log = fopen("sdmc:/3ds/minivideo_log.txt", "w");
+    av_log_set_level(AV_LOG_INFO);
+    av_log_set_callback(av_log_cb);
+    check_ffmpeg_build();
+
     char path[512];
     if (!find_avi("sdmc:/videos/", path, sizeof(path)) &&
         !find_avi("sdmc:/", path, sizeof(path)) &&
@@ -420,11 +635,11 @@ int main(void)
     }
     printf("File: %s\n", path);
 
-    if (avformat_open_input(&c.fmt, path, NULL, NULL) < 0 ||
-        avformat_find_stream_info(c.fmt, NULL) < 0) {
-        printf("Cannot open/probe file\n");
+    if (!open_media(&c, path)) {
+        say("Open failed - details above and in sdmc:/3ds/minivideo_log.txt\n");
         goto wait_exit;
     }
+    say("[3/3] streams ready, opening decoders\n");
 
     int vi = av_find_best_stream(c.fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     int ai = av_find_best_stream(c.fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
@@ -501,7 +716,8 @@ wait_exit:
     av_frame_free(&c.aframe);
     avcodec_free_context(&c.vctx);
     avcodec_free_context(&c.actx);
-    if (c.fmt) avformat_close_input(&c.fmt);
+    close_media(&c);
+    if (g_log) { fclose(g_log); g_log = NULL; }
     gfxExit();
     return 0;
 }
