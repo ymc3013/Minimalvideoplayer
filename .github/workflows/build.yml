@@ -1,40 +1,63 @@
 
-name: Build Minimalvideoplayer
+name: Import video decoding libraries
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    paths:
+      - ".github/workflows/build.yml"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  build:
+  import-libraries:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout custom repository
+      - name: Checkout Minimalvideoplayer
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
-      - name: Download video player source
+      - name: Download upstream library files only
         run: |
           git clone --depth 1 \
             https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
-            upstream
+            /tmp/video-reference
 
-      - name: Compile 3DSX
+          mkdir -p third_party/decoder
+
+          test -d /tmp/video-reference/library/include
+          test -d /tmp/video-reference/library/lib
+
+          rm -rf third_party/decoder/include
+          rm -rf third_party/decoder/lib
+
+          cp -a /tmp/video-reference/library/include \
+            third_party/decoder/include
+
+          cp -a /tmp/video-reference/library/lib \
+            third_party/decoder/lib
+
+          cp /tmp/video-reference/LICENSE \
+            third_party/decoder/UPSTREAM_LICENSE.txt
+
+          echo "Imported library files:"
+          find third_party/decoder -type f
+
+      - name: Commit library files to repository
         run: |
-          docker run --rm \
-            -v "$GITHUB_WORKSPACE/upstream:/work" \
-            -w /work \
-            devkitpro/devkitarm:latest \
-            bash -lc 'make 3dsx'
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Upload 3DSX
-        uses: actions/upload-artifact@v4
-        with:
-          name: Minimalvideoplayer-3DSX
-          path: upstream/*.3dsx
-          if-no-files-found: error
+          git add third_party/decoder
+
+          if git diff --cached --quiet; then
+            echo "No library changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Import video decoding libraries"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
