@@ -12,20 +12,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up devkitPro (official action)
+      - name: Set up devkitPro
         uses: devkitPro/setup-devkitpro@v1
 
-      - name: Install devkitARM and zlib
+      - name: Install ARM toolchain and zlib
         run: |
           sudo dkp-pacman -Sy --noconfirm
           sudo dkp-pacman -S --noconfirm devkitARM arm-none-eabi-zlib
 
-      - name: Export DEVKIT env
+      - name: Export environment
         run: |
           echo "DEVKITPRO=/opt/devkitpro" >> $GITHUB_ENV
           echo "DEVKITARM=/opt/devkitpro/devkitARM" >> $GITHUB_ENV
 
-      - name: Build
+      - name: Build the 3DS app
         env:
           DEVKITPRO: ${{ env.DEVKITPRO }}
           DEVKITARM: ${{ env.DEVKITARM }}
