@@ -1,4 +1,3 @@
-
 .SUFFIXES:
 
 ifeq ($(strip $(DEVKITARM)),)
@@ -22,18 +21,37 @@ ARCH := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 
 CFLAGS := -O2 -Wall -mword-relocations -ffunction-sections $(ARCH)
 CFLAGS += -D__3DS__ -U__STRICT_ANSI__ -std=gnu11
+CFLAGS += $(foreach dir,$(INCLUDES),-I$(dir))
 
 LDFLAGS := -specs=3dsx.specs $(ARCH) -Wl,--gc-sections
+LDFLAGS += $(foreach dir,$(LIBDIRS),-L$(dir))
 
 LIBS := -lswresample -lavformat -lswscale -lavcodec -lavutil
 LIBS += -lcitro2d -lcitro3d -lx264 -lmp3lame -ldav1d
 LIBS += -lcurl -lnghttp2 -lmbedtls -lmbedx509 -lmbedcrypto
 LIBS += -lctru -lz -lm
 
+CFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
+OFILES := $(CFILES:.c=.o)
+OFILES := $(addprefix $(BUILD)/,$(OFILES))
+
 .PHONY: all clean
 
-all: 3dsx
+all: $(TARGET).3dsx
+
+$(BUILD):
+	mkdir -p $(BUILD)
+
+$(BUILD)/%.o: $(SOURCES)/%.c | $(BUILD)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(TARGET).elf: $(OFILES)
+	$(CC) $(LDFLAGS) -o $@ $(OFILES) $(LIBS)
+
+$(TARGET).3dsx: $(TARGET).elf
+	$(3DSXTOOL) $< $@
 
 clean:
 	rm -rf $(BUILD) $(TARGET).3dsx $(TARGET).elf $(TARGET).smdh
 
+-include $(OFILES:.o=.d)
