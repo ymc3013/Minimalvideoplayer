@@ -4,11 +4,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
+#include <limits.h>
 
 #include <libavformat/avformat.h>
+#include <libavformat/avio.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/error.h>
+#include <libavutil/mem.h>
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 
@@ -19,14 +23,102 @@
 #define AUDIO_CHANNELS 2
 #define AUDIO_BUFFER_SAMPLES 4096
 #define AUDIO_BUFFER_COUNT 4
+#define IO_BUFFER_SIZE 32768
 
 static ndspWaveBuf audioBuffers[AUDIO_BUFFER_COUNT];
 static int16_t *audioMemory[AUDIO_BUFFER_COUNT];
 static int audioIndex = 0;
 
+/*
+ * Lecture d'un fichier via stdio/libctru.
+ * FFmpeg utilise ce callback au lieu de chercher un protocole "sdmc".
+ */
+static int read_file_packet(void *opaque, uint8_t *buffer, int buffer_size)
+{
+    FILE *file = (FILE *)opaque;
+    size_t count;
+
+    if (buffer_size <= 0)
+        return AVERROR(EINVAL);
+
+    count = fread(buffer, 1, (size_t)buffer_size, file);
+
+    if (count > 0)
+        return (int)count;
+
+    if (feof(file))
+        return AVERROR_EOF;
+
+    return AVERROR(errno ? errno : EIO);
+}
+
+/*
+ * Permet à FFmpeg de connaître la taille du fichier et de se déplacer
+ * dans l'AVI. fseek/ftell sont utilisés pour rester compatibles avec
+ * la bibliothèque C de la Nintendo 3DS.
+ */
+static int64_t seek_file_packet(void *opaque, int64_t offset, int whence)
+{
+    FILE *file = (FILE *)opaque;
+    long current;
+    long end;
+    int origin;
+
+    if (whence == AVSEEK_SIZE) {
+        current = ftell(file);
+        if (current < 0)
+            return AVERROR(errno ? errno : EIO);
+
+        if (fseek(file, 0, SEEK_END) != 0)
+            return AVERROR(errno ? errno : EIO);
+
+        end = ftell(file);
+
+        if (fseek(file, current, SEEK_SET) != 0)
+            return AVERROR(errno ? errno : EIO);
+
+        if (end < 0)
+            return AVERROR(errno ? errno : EIO);
+
+        return (int64_t)end;
+    }
+
+    whence &= ~AVSEEK_FORCE;
+
+    switch (whence) {
+    case SEEK_SET:
+        origin = SEEK_SET;
+        break;
+
+    case SEEK_CUR:
+        origin = SEEK_CUR;
+        break;
+
+    case SEEK_END:
+        origin = SEEK_END;
+        break;
+
+    default:
+        return AVERROR(EINVAL);
+    }
+
+    if (offset > LONG_MAX || offset < LONG_MIN)
+        return AVERROR(EINVAL);
+
+    if (fseek(file, (long)offset, origin) != 0)
+        return AVERROR(errno ? errno : EIO);
+
+    current = ftell(file);
+    if (current < 0)
+        return AVERROR(errno ? errno : EIO);
+
+    return (int64_t)current;
+}
+
 static void show_error(const char *message, int error)
 {
     char text[AV_ERROR_MAX_STRING_SIZE];
+
     av_strerror(error, text, sizeof(text));
 
     consoleInit(GFX_TOP, NULL);
@@ -35,8 +127,10 @@ static void show_error(const char *message, int error)
 
     while (aptMainLoop()) {
         hidScanInput();
+
         if (hidKeysDown() & KEY_START)
             break;
+
         gspWaitForVBlank();
     }
 }
@@ -57,16 +151,21 @@ static void display_frame(struct SwsContext *scaler,
               destData,
               destStride);
 
-    u16 width = 0, height = 0;
-    u8 *fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT,
-                               &width, &height);
+    u16 width = 0;
+    u16 height = 0;
+
+    u8 *fb = gfxGetFramebuffer(
+        GFX_TOP,
+        GFX_LEFT,
+        &width,
+        &height
+    );
 
     if (!fb || width != SCREEN_W || height != SCREEN_H)
         return;
 
     /*
-     * Le framebuffer de la 3DS est organisé par colonnes,
-     * avec l'axe vertical inversé.
+     * Copie de l'image convertie dans le framebuffer.
      */
     for (int y = 0; y < SCREEN_H; y++) {
         for (int x = 0; x < SCREEN_W; x++) {
@@ -94,18 +193,21 @@ static void queue_audio(const uint8_t *data, int samples)
 
     ndspWaveBuf *buf = &audioBuffers[audioIndex];
 
-    while (aptMainLoop() && buf->status == NDSP_WBUF_PLAYING) {
+    while (aptMainLoop() &&
+           buf->status == NDSP_WBUF_PLAYING) {
         gspWaitForVBlank();
     }
 
     if (!aptMainLoop())
         return;
 
-    size_t bytes = (size_t)samples * AUDIO_CHANNELS * sizeof(int16_t);
+    size_t bytes =
+        (size_t)samples * AUDIO_CHANNELS * sizeof(int16_t);
 
     memcpy(audioMemory[audioIndex], data, bytes);
 
     memset(buf, 0, sizeof(*buf));
+
     buf->data_vaddr = audioMemory[audioIndex];
     buf->nsamples = samples;
     buf->looping = false;
@@ -119,35 +221,52 @@ static void queue_audio(const uint8_t *data, int samples)
 int main(void)
 {
     AVFormatContext *format = NULL;
+    AVIOContext *customIO = NULL;
+
     AVCodecContext *videoCodec = NULL;
     AVCodecContext *audioCodec = NULL;
+
     AVPacket *packet = NULL;
     AVFrame *frame = NULL;
+
     SwsContext *scaler = NULL;
     SwrContext *resampler = NULL;
+
+    FILE *videoFile = NULL;
 
     uint8_t *rgb = NULL;
     uint8_t *audioConverted = NULL;
 
     int videoStream = -1;
     int audioStream = -1;
+
     int result = 0;
     int ndspStarted = 0;
 
     gfxInitDefault();
     gfxSet3D(false);
 
+    /*
+     * Allocation des buffers audio.
+     */
     for (int i = 0; i < AUDIO_BUFFER_COUNT; i++) {
         audioMemory[i] = linearAlloc(
-            AUDIO_BUFFER_SAMPLES * AUDIO_CHANNELS * sizeof(int16_t));
+            AUDIO_BUFFER_SAMPLES *
+            AUDIO_CHANNELS *
+            sizeof(int16_t)
+        );
 
         if (!audioMemory[i]) {
             result = AVERROR(ENOMEM);
-            goto cleanup;
+            goto error;
         }
     }
 
-    ndspInit();
+    if (ndspInit() != 0) {
+        result = AVERROR_EXTERNAL;
+        goto error;
+    }
+
     ndspStarted = 1;
 
     ndspSetOutputMode(NDSP_OUTPUT_STEREO);
@@ -156,24 +275,89 @@ int main(void)
     ndspChnSetRate(0, AUDIO_RATE);
     ndspChnSetFormat(0, NDSP_FORMAT_STEREO_PCM16);
 
-    result = avformat_open_input(&format, VIDEO_PATH, NULL, NULL);
+    /*
+     * Ouverture du fichier depuis la carte SD.
+     */
+    videoFile = fopen(VIDEO_PATH, "rb");
+
+    if (!videoFile) {
+        result = AVERROR(errno ? errno : ENOENT);
+        goto error;
+    }
+
+    /*
+     * Création du contexte d'entrée personnalisé.
+     */
+    {
+        uint8_t *ioBuffer =
+            (uint8_t *)av_malloc(IO_BUFFER_SIZE);
+
+        if (!ioBuffer) {
+            result = AVERROR(ENOMEM);
+            goto error;
+        }
+
+        customIO = avio_alloc_context(
+            ioBuffer,
+            IO_BUFFER_SIZE,
+            0,
+            videoFile,
+            read_file_packet,
+            NULL,
+            seek_file_packet
+        );
+
+        if (!customIO) {
+            av_free(ioBuffer);
+            result = AVERROR(ENOMEM);
+            goto error;
+        }
+    }
+
+    format = avformat_alloc_context();
+
+    if (!format) {
+        result = AVERROR(ENOMEM);
+        goto error;
+    }
+
+    format->pb = customIO;
+    format->flags |= AVFMT_FLAG_CUSTOM_IO;
+
+    /*
+     * NULL comme nom de fichier :
+     * FFmpeg lit les données via notre AVIOContext.
+     */
+    result = avformat_open_input(
+        &format,
+        NULL,
+        NULL,
+        NULL
+    );
+
     if (result < 0)
         goto error;
 
     result = avformat_find_stream_info(format, NULL);
+
     if (result < 0)
         goto error;
 
+    /*
+     * Recherche des flux vidéo et audio.
+     */
     for (unsigned int i = 0; i < format->nb_streams; i++) {
         AVStream *stream = format->streams[i];
 
         if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
-            videoStream < 0)
+            videoStream < 0) {
             videoStream = (int)i;
+        }
 
         if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
-            audioStream < 0)
+            audioStream < 0) {
             audioStream = (int)i;
+        }
     }
 
     if (videoStream < 0) {
@@ -181,9 +365,13 @@ int main(void)
         goto error;
     }
 
+    /*
+     * Initialisation du décodeur vidéo.
+     */
     {
         AVCodecParameters *params =
             format->streams[videoStream]->codecpar;
+
         const AVCodec *decoder =
             avcodec_find_decoder(params->codec_id);
 
@@ -193,22 +381,31 @@ int main(void)
         }
 
         videoCodec = avcodec_alloc_context3(decoder);
+
         if (!videoCodec) {
             result = AVERROR(ENOMEM);
             goto error;
         }
 
-        result = avcodec_parameters_to_context(videoCodec, params);
+        result = avcodec_parameters_to_context(
+            videoCodec,
+            params
+        );
+
         if (result < 0)
             goto error;
 
         videoCodec->thread_count = 1;
 
         result = avcodec_open2(videoCodec, decoder, NULL);
+
         if (result < 0)
             goto error;
     }
 
+    /*
+     * Conversion de l'image vers le format RGB affichable.
+     */
     scaler = sws_getContext(
         videoCodec->width,
         videoCodec->height,
@@ -217,7 +414,10 @@ int main(void)
         SCREEN_H,
         AV_PIX_FMT_RGB24,
         SWS_BILINEAR,
-        NULL, NULL, NULL);
+        NULL,
+        NULL,
+        NULL
+    );
 
     if (!scaler) {
         result = AVERROR(ENOMEM);
@@ -225,6 +425,7 @@ int main(void)
     }
 
     rgb = malloc(SCREEN_W * SCREEN_H * 3);
+
     if (!rgb) {
         result = AVERROR(ENOMEM);
         goto error;
@@ -238,9 +439,13 @@ int main(void)
         goto error;
     }
 
+    /*
+     * Initialisation du décodeur audio si le fichier en possède un.
+     */
     if (audioStream >= 0) {
         AVCodecParameters *params =
             format->streams[audioStream]->codecpar;
+
         const AVCodec *decoder =
             avcodec_find_decoder(params->codec_id);
 
@@ -249,11 +454,17 @@ int main(void)
 
             if (audioCodec) {
                 result = avcodec_parameters_to_context(
-                    audioCodec, params);
+                    audioCodec,
+                    params
+                );
 
-                if (result >= 0)
+                if (result >= 0) {
                     result = avcodec_open2(
-                        audioCodec, decoder, NULL);
+                        audioCodec,
+                        decoder,
+                        NULL
+                    );
+                }
 
                 if (result < 0) {
                     avcodec_free_context(&audioCodec);
@@ -274,7 +485,8 @@ int main(void)
                         &inputLayout,
                         audioCodec->ch_layout.nb_channels > 0
                             ? audioCodec->ch_layout.nb_channels
-                            : 2);
+                            : 2
+                    );
                 }
 
                 result = swr_alloc_set_opts2(
@@ -286,12 +498,14 @@ int main(void)
                     audioCodec->sample_fmt,
                     audioCodec->sample_rate,
                     0,
-                    NULL);
+                    NULL
+                );
 
                 av_channel_layout_uninit(&inputLayout);
                 av_channel_layout_uninit(&outputLayout);
 
-                if (result < 0 || !resampler ||
+                if (result < 0 ||
+                    !resampler ||
                     swr_init(resampler) < 0) {
                     swr_free(&resampler);
                     avcodec_free_context(&audioCodec);
@@ -301,10 +515,14 @@ int main(void)
         }
     }
 
+    /*
+     * Boucle principale de lecture.
+     */
     while (aptMainLoop() &&
            av_read_frame(format, packet) >= 0) {
 
         hidScanInput();
+
         if (hidKeysDown() & KEY_START) {
             av_packet_unref(packet);
             break;
@@ -315,35 +533,48 @@ int main(void)
 
             if (result >= 0) {
                 while (avcodec_receive_frame(
-                           videoCodec, frame) >= 0) {
+                           videoCodec,
+                           frame) >= 0) {
+
                     display_frame(
-                        scaler, frame, rgb, SCREEN_W * 3);
+                        scaler,
+                        frame,
+                        rgb,
+                        SCREEN_W * 3
+                    );
+
                     av_frame_unref(frame);
                 }
             }
-        } else if (audioCodec && resampler &&
+        } else if (audioCodec &&
+                   resampler &&
                    packet->stream_index == audioStream) {
 
             result = avcodec_send_packet(audioCodec, packet);
 
             if (result >= 0) {
                 while (avcodec_receive_frame(
-                           audioCodec, frame) >= 0) {
+                           audioCodec,
+                           frame) >= 0) {
 
                     int capacity = (int)av_rescale_rnd(
-                        swr_get_delay(resampler,
-                                      audioCodec->sample_rate) +
-                            frame->nb_samples,
+                        swr_get_delay(
+                            resampler,
+                            audioCodec->sample_rate
+                        ) + frame->nb_samples,
                         AUDIO_RATE,
                         audioCodec->sample_rate,
-                        AV_ROUND_UP);
+                        AV_ROUND_UP
+                    );
 
                     if (capacity > 0 &&
                         capacity <= AUDIO_BUFFER_SAMPLES) {
 
                         audioConverted = malloc(
                             (size_t)capacity *
-                            AUDIO_CHANNELS * sizeof(int16_t));
+                            AUDIO_CHANNELS *
+                            sizeof(int16_t)
+                        );
 
                         if (audioConverted) {
                             uint8_t *out[] = {
@@ -355,11 +586,15 @@ int main(void)
                                 out,
                                 capacity,
                                 (const uint8_t **)frame->extended_data,
-                                frame->nb_samples);
+                                frame->nb_samples
+                            );
 
-                            if (converted > 0)
+                            if (converted > 0) {
                                 queue_audio(
-                                    audioConverted, converted);
+                                    audioConverted,
+                                    converted
+                                );
+                            }
 
                             free(audioConverted);
                             audioConverted = NULL;
@@ -385,11 +620,25 @@ cleanup:
 
     sws_freeContext(scaler);
     swr_free(&resampler);
+
     av_packet_free(&packet);
     av_frame_free(&frame);
+
     avcodec_free_context(&videoCodec);
     avcodec_free_context(&audioCodec);
+
     avformat_close_input(&format);
+
+    /*
+     * Le contexte AVIO personnalisé doit être libéré séparément.
+     */
+    if (customIO) {
+        av_freep(&customIO->buffer);
+        avio_context_free(&customIO);
+    }
+
+    if (videoFile)
+        fclose(videoFile);
 
     if (ndspStarted)
         ndspExit();
@@ -400,5 +649,6 @@ cleanup:
     }
 
     gfxExit();
+
     return 0;
 }
