@@ -1,18 +1,6 @@
 /*
  * Minimal AVI player - dual video version for Nintendo 3DS (devkitARM + libctru + FFmpeg)
- *
- *   top.avi -> TOP screen    (400x240 area, picture only, its audio is ignored)
- *   bot.avi -> BOTTOM screen (320x240 area, picture + THE ONLY audio)
- *
- * Files are looked up (case-insensitive) in sdmc:/videos/, sdmc:/, sdmc:/3ds/.
- * If only one of them exists, only that one is played. If NEITHER exists, the first *.avi
- * found is played on the top screen with its audio (previous single-video behaviour).
- *
- * Per video: reader thread (demux) -> packet queues -> video thread (decode+draw).
- * Bottom video additionally: audio thread (decode + NDSP).
- * The top video is synchronised on the bottom video's audio clock, so both stay together.
- *
- * Controls: A = pause/resume, START = quit.
+ * Chargement séquentiel et thread-safe.
  */
 
 #include <3ds.h>
@@ -39,18 +27,17 @@
 #include <libavutil/log.h>
 
 #define SCR_H 240
-#define FB_W  240            /* framebuffer "width" = physical screen height */
+#define FB_W  240
 
 #define ACH          0
 #define ABUFS        16
-#define ABUF_SAMPLES 16384   /* max samples per NDSP buffer (stereo S16 => 4 bytes/sample) */
-#define LATE_DROP    0.150   /* seconds */
+#define ABUF_SAMPLES 16384
+#define LATE_DROP    0.150
 
 #define HAS_CHLAYOUT (LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 24, 100))
 
 /* ------------------------------------------------------------------ types */
 
-/* thread-safe FIFO of demuxed packets (LightLock-protected) */
 typedef struct {
     AVPacket **q;
     int        cap, head, tail, count;
@@ -63,32 +50,31 @@ typedef struct {
     ndspWaveBuf wb[ABUFS];
     int16_t    *mem;
     int         next;
-    int64_t     start[ABUFS];   /* absolute sample index at which each buffer starts */
-    int64_t     queued;         /* total samples queued so far */
-    double      last_clock;     /* monotonic, seconds of audio played */
+    int64_t     start[ABUFS];
+    int64_t     queued;
+    double      last_clock;
     int         rate;
 } Audio;
 
 typedef struct Player {
-    const char  *tag;                 /* "TOP" / "BOT" for messages */
+    const char  *tag;
     char         path[512];
-    bool         present;             /* file found */
-    bool         active;              /* opened + decoders ready */
+    bool         present;
+    bool         active;
     gfxScreen_t  screen;
-    int          scr_w;               /* 400 (top) or 320 (bottom) */
-    bool         want_audio;          /* only the bottom player (or legacy single video) */
-    struct Player *clock_src;         /* player whose audio clock is the master, or NULL = self */
+    int          scr_w;
+    bool         want_audio;
+    struct Player *clock_src;
 
     AVFormatContext *fmt;
     int          vi, ai;
-    FILE        *fp;                  /* custom AVIO fallback */
+    FILE        *fp;
     AVIOContext *pb;
 
     AVCodecContext *vctx, *actx;
     AVStream    *vst, *ast;
     AVFrame     *vframe, *aframe;
 
-    /* video scaling */
     struct SwsContext *sws;
     int       sws_w, sws_h, sws_fmt;
     uint8_t  *dst_data[4];
@@ -97,23 +83,20 @@ typedef struct Player {
     bool      dst_alloc;
     double    frame_dur;
     double    next_vpts;
-    bool      skipping;               /* decoder skip_frame active (catching up) */
+    bool      skipping;
 
-    /* audio */
     struct SwrContext *swr;
     Audio     au;
     int16_t  *tmp;
     int       tmp_cap;
-    volatile bool audio_on;           /* audio really used (decoder + NDSP + setup ok) */
+    volatile bool audio_on;
     volatile bool aud_ready;
     double    audio_base;
 
-    /* fallback wall clock */
     u64       wall0;
     double    vbase_pts;
     volatile bool have_vbase;
 
-    /* pipeline */
     PQ        vq, aq;
     Thread    th_reader, th_audio, th_video;
     volatile bool go;
@@ -128,12 +111,12 @@ typedef struct Player {
 static volatile bool g_quit;
 static volatile bool g_paused;
 static volatile u64  g_paused_ms;
-static bool          g_ndsp;           /* NDSP initialised */
-static volatile bool g_quiet;          /* true = bottom screen shows video, no console text */
+static bool          g_ndsp;
+static volatile bool g_quiet;
 static FILE         *g_log;
-static LightLock     g_gfx_lock;
+static LightLock     g_gfx_lock; /* Protège TOUT le rendu graphique 3DS */
 
-/* ------------------------------------------------------------------ logging / diagnostics */
+/* ------------------------------------------------------------------ logging */
 
 static void say(const char *f, ...)
 {
@@ -142,12 +125,10 @@ static void say(const char *f, ...)
     va_start(v, f);
     vsnprintf(b, sizeof(b), f, v);
     va_end(v);
-    /* On affiche sur l'écran du haut si on n'est pas en mode vidéo (g_quiet) */
     if (!g_quiet) fputs(b, stdout);
     if (g_log) { fputs(b, g_log); fflush(g_log); }
 }
 
-/* FFmpeg's own messages: INFO and below go to the log file, WARNING and below also to the screen */
 static void av_log_cb(void *ptr, int level, const char *fmt, va_list vl)
 {
     (void)ptr;
@@ -161,44 +142,25 @@ static void av_log_cb(void *ptr, int level, const char *fmt, va_list vl)
 static void check_ffmpeg_build(void)
 {
     unsigned rf = avformat_version(), rc = avcodec_version(), ru = avutil_version();
-    unsigned rs = swscale_version(), rr = swresample_version();
-    say("FFmpeg runtime: avformat %u.%u avcodec %u.%u avutil %u.%u\n",
+    say("FFmpeg: avformat %u.%u avcodec %u.%u avutil %u.%u\n",
         rf >> 16, (rf >> 8) & 255, rc >> 16, (rc >> 8) & 255, ru >> 16, (ru >> 8) & 255);
 
-#define CHK_VER(name, rt, hdr) \
-    if (((rt) >> 8) != ((unsigned)(hdr) >> 8)) \
-        say("WARNING %s: headers %u.%u != library %u.%u (struct layouts may differ!)\n", name, \
-            (unsigned)(hdr) >> 16, ((unsigned)(hdr) >> 8) & 255, (rt) >> 16, ((rt) >> 8) & 255)
-    CHK_VER("avformat",   rf, LIBAVFORMAT_VERSION_INT);
-    CHK_VER("avcodec",    rc, LIBAVCODEC_VERSION_INT);
-    CHK_VER("avutil",     ru, LIBAVUTIL_VERSION_INT);
-    CHK_VER("swscale",    rs, LIBSWSCALE_VERSION_INT);
-    CHK_VER("swresample", rr, LIBSWRESAMPLE_VERSION_INT);
-#undef CHK_VER
-
     const AVInputFormat *avi = av_find_input_format("avi");
-    say("demuxer 'avi': %s\n", avi ? "present" : "MISSING from this FFmpeg build");
+    say("demuxer 'avi': %s\n", avi ? "present" : "MISSING");
 
-    bool has_file = false;
-    void *op = NULL;
-    const char *pn;
-    while ((pn = avio_enum_protocols(&op, 0))) if (!strcmp(pn, "file")) has_file = true;
-    say("protocol 'file': %s\n", has_file ? "present" : "MISSING from this FFmpeg build");
-
-    if (g_log) fprintf(g_log, "FFmpeg configure line: %s\n", avformat_configuration());
+    if (g_log) fprintf(g_log, "FFmpeg config: %s\n", avformat_configuration());
 }
 
 static const char *explain_err(int r)
 {
     switch (r) {
-    case AVERROR_PROTOCOL_NOT_FOUND: return "protocol not found (URL scheme unknown or 'file' protocol not built in)";
-    case AVERROR_DEMUXER_NOT_FOUND:  return "no demuxer for this data (not built in?)";
-    case AVERROR_INVALIDDATA:        return "data not recognised / corrupt (not a valid AVI, or truncated)";
+    case AVERROR_PROTOCOL_NOT_FOUND: return "protocol not found";
+    case AVERROR_DEMUXER_NOT_FOUND:  return "no demuxer";
+    case AVERROR_INVALIDDATA:        return "invalid data";
     case AVERROR(ENOENT):            return "file not found";
-    case AVERROR(EIO):               return "I/O error while reading";
+    case AVERROR(EIO):               return "I/O error";
     case AVERROR(ENOMEM):            return "out of memory";
-    case AVERROR(EACCES):            return "permission denied";
-    default:                         return "see message above";
+    default:                         return "unknown";
     }
 }
 
@@ -242,7 +204,6 @@ static size_t pq_bytes(PQ *p)
     return b;
 }
 
-/* takes ownership of the packet's data (src is left empty) */
 static bool pq_push(PQ *p, AVPacket *src)
 {
     AVPacket *n = av_packet_alloc();
@@ -284,7 +245,7 @@ static void pq_free(PQ *p)
     p->q = NULL;
 }
 
-/* ------------------------------------------------------------------ audio (bottom / legacy player only) */
+/* ------------------------------------------------------------------ audio */
 
 static void audio_init_buffers(Audio *a)
 {
@@ -310,7 +271,6 @@ static double audio_clock(Audio *a)
     return a->last_clock;
 }
 
-/* queue n interleaved stereo S16 samples; waits (pause-safe) if all buffers are busy */
 static bool audio_push(Player *p, const int16_t *src, int n)
 {
     Audio *a = &p->au;
@@ -319,13 +279,13 @@ static bool audio_push(Player *p, const int16_t *src, int n)
         while (wb->status == NDSP_WBUF_QUEUED || wb->status == NDSP_WBUF_PLAYING) {
             if (g_quit) return false;
             if (g_paused) { svcSleepThread(10000000LL); continue; }
-            svcSleepThread(2000000LL);                 /* 2 ms */
+            svcSleepThread(2000000LL);
         }
         int chunk = n > ABUF_SAMPLES ? ABUF_SAMPLES : n;
         int16_t *dst = (int16_t *)wb->data_vaddr;
         memcpy(dst, src, (size_t)chunk * 2 * sizeof(int16_t));
         DSP_FlushDataCache(dst, (u32)chunk * 2 * sizeof(int16_t));
-        wb->nsamples = (u32)chunk;                      /* SAMPLES, not bytes */
+        wb->nsamples = (u32)chunk;
         wb->looping  = false;
         a->start[a->next] = a->queued;
         a->queued += chunk;
@@ -337,7 +297,6 @@ static bool audio_push(Player *p, const int16_t *src, int n)
     return true;
 }
 
-/* create swr + configure NDSP from the first REAL decoded frame */
 static bool audio_setup_from_frame(Player *p, const AVFrame *f)
 {
     int rate = f->sample_rate > 0 ? f->sample_rate : p->actx->sample_rate;
@@ -375,9 +334,7 @@ static bool audio_setup_from_frame(Player *p, const AVFrame *f)
     ndspChnSetRate(ACH, (float)rate);
     ndspChnSetFormat(ACH, NDSP_FORMAT_STEREO_PCM16);
     ndspChnSetMix(ACH, mix);
-    say("[%s] Audio: %s %s %d Hz, %d ch -> S16 stereo\n", p->tag,
-        avcodec_get_name(p->actx->codec_id),
-        av_get_sample_fmt_name((enum AVSampleFormat)f->format), rate, nb);
+    say("[%s] Audio: %s %d Hz, %d ch\n", p->tag, avcodec_get_name(p->actx->codec_id), rate, nb);
     return true;
 }
 
@@ -402,8 +359,7 @@ static void handle_audio(Player *p, AVPacket *pkt)
             if (!p->tmp) { av_frame_unref(f); return; }
         }
         uint8_t *outp[1] = { (uint8_t *)p->tmp };
-        int n = swr_convert(p->swr, outp, p->tmp_cap,
-                            (const uint8_t **)f->extended_data, f->nb_samples);
+        int n = swr_convert(p->swr, outp, p->tmp_cap, (const uint8_t **)f->extended_data, f->nb_samples);
         av_frame_unref(f);
         if (n <= 0) continue;
         if (!audio_push(p, p->tmp, n)) return;
@@ -430,8 +386,7 @@ static bool video_setup_scaler(Player *p, const AVFrame *f)
     if (p->dh < 2) p->dh = 2;
 
     p->sws = sws_getContext(f->width, f->height, (enum AVPixelFormat)f->format,
-                            p->dw, p->dh, AV_PIX_FMT_BGR24,
-                            SWS_BILINEAR, NULL, NULL, NULL);
+                            p->dw, p->dh, AV_PIX_FMT_BGR24, SWS_BILINEAR, NULL, NULL, NULL);
     if (!p->sws) return false;
     if (av_image_alloc(p->dst_data, p->dst_linesize, p->dw, p->dh, AV_PIX_FMT_BGR24, 32) < 0) {
         sws_freeContext(p->sws); p->sws = NULL; return false;
@@ -439,12 +394,13 @@ static bool video_setup_scaler(Player *p, const AVFrame *f)
     p->dst_alloc = true;
     p->sws_w = f->width; p->sws_h = f->height; p->sws_fmt = f->format;
 
-    /* clear this screen once so letterbox bars are black */
+    LightLock_Lock(&g_gfx_lock);
     u16 fw, fh;
     u8 *fb = gfxGetFramebuffer(p->screen, GFX_LEFT, &fw, &fh);
     if (fb) memset(fb, 0, (size_t)FB_W * p->scr_w * 3);
-    say("[%s] Video: %s %s %dx%d -> %dx%d\n", p->tag, avcodec_get_name(p->vctx->codec_id),
-        av_get_pix_fmt_name((enum AVPixelFormat)f->format), f->width, f->height, p->dw, p->dh);
+    LightLock_Unlock(&g_gfx_lock);
+
+    say("[%s] Video: %dx%d -> %dx%d\n", p->tag, f->width, f->height, p->dw, p->dh);
     return true;
 }
 
@@ -455,30 +411,25 @@ static void video_render(Player *p, const AVFrame *f)
     sws_scale(p->sws, (const uint8_t * const *)f->data, f->linesize, 0, f->height,
               p->dst_data, p->dst_linesize);
 
-    /* Lock around the framebuffer access to prevent races between top and bot threads */
+    /* VERROU GLOBAL : gfxGetFramebuffer et gfxScreenSwapBuffers ne sont pas thread-safe */
     LightLock_Lock(&g_gfx_lock);
     u16 fw, fh;
-    u8 *fb = gfxGetFramebuffer(p->screen, GFX_LEFT, &fw, &fh);   /* fw=240 */
-    if (!fb) {
-        LightLock_Unlock(&g_gfx_lock);
-        return;
-    }
-
-    int ox = (p->scr_w - p->dw) / 2;
-    int oy = (SCR_H - p->dh) / 2;
-
-    for (int y = 0; y < p->dh; y++) {
-        const uint8_t *s = p->dst_data[0] + (size_t)y * p->dst_linesize[0];   /* real stride */
-        /* pixel (X,Y) lives at ((X*240) + (239-Y)) * 3, bytes B,G,R (same for both screens) */
-        u8 *d = fb + ((size_t)ox * FB_W + (FB_W - 1 - (oy + y))) * 3;
-        for (int x = 0; x < p->dw; x++) {
-            d[0] = s[0]; d[1] = s[1]; d[2] = s[2];
-            s += 3;
-            d += (size_t)FB_W * 3;
+    u8 *fb = gfxGetFramebuffer(p->screen, GFX_LEFT, &fw, &fh);
+    if (fb) {
+        int ox = (p->scr_w - p->dw) / 2;
+        int oy = (SCR_H - p->dh) / 2;
+        for (int y = 0; y < p->dh; y++) {
+            const uint8_t *s = p->dst_data[0] + (size_t)y * p->dst_linesize[0];
+            u8 *d = fb + ((size_t)ox * FB_W + (FB_W - 1 - (oy + y))) * 3;
+            for (int x = 0; x < p->dw; x++) {
+                d[0] = s[0]; d[1] = s[1]; d[2] = s[2];
+                s += 3;
+                d += (size_t)FB_W * 3;
+            }
         }
+        GSPGPU_FlushDataCache(fb, (u32)FB_W * p->scr_w * 3);
+        gfxScreenSwapBuffers(p->screen, false);
     }
-    GSPGPU_FlushDataCache(fb, (u32)FB_W * p->scr_w * 3);
-    gfxScreenSwapBuffers(p->screen, false);
     LightLock_Unlock(&g_gfx_lock);
 }
 
@@ -511,9 +462,7 @@ static void video_present(Player *p, const AVFrame *f, double pts)
         p->wall0 = osGetTime();
     }
 
-    bool wait_ok = master_ready(p);
-
-    if (wait_ok) {
+    if (master_ready(p)) {
         int waited = 0;
         while (!g_quit && pts - master_clock(p) > 0.002) {
             if (g_paused) { svcSleepThread(10000000LL); continue; }
@@ -544,7 +493,7 @@ static void handle_video(Player *p, AVPacket *pkt)
     }
 }
 
-/* ------------------------------------------------------------------ file lookup */
+/* ------------------------------------------------------------------ file lookup & media */
 
 static bool is_avi(const char *n)
 {
@@ -570,7 +519,6 @@ static bool find_in_dir(const char *dir, const char *name, char *out, size_t cap
     return ok;
 }
 
-/* name == NULL -> first *.avi */
 static bool find_file(const char *name, char *out, size_t cap)
 {
     return find_in_dir("sdmc:/videos/", name, out, cap) ||
@@ -580,30 +528,17 @@ static bool find_file(const char *name, char *out, size_t cap)
 
 static AVCodecContext *open_decoder(const char *tag, AVStream *st)
 {
-    char err[AV_ERROR_MAX_STRING_SIZE];
     const AVCodec *codec = avcodec_find_decoder(st->codecpar->codec_id);
     if (!codec) {
-        say("[%s] No decoder compiled in for '%s'\n", tag, avcodec_get_name(st->codecpar->codec_id));
+        say("[%s] No decoder for '%s'\n", tag, avcodec_get_name(st->codecpar->codec_id));
         return NULL;
     }
     AVCodecContext *ctx = avcodec_alloc_context3(codec);
     if (!ctx) return NULL;
-    int r = avcodec_parameters_to_context(ctx, st->codecpar);
-    if (r < 0) {
-        say("[%s] avcodec_parameters_to_context failed: %d (%s)\n", tag, r, av_make_error_string(err, sizeof(err), r));
-        avcodec_free_context(&ctx);
-        return NULL;
-    }
-    r = avcodec_open2(ctx, codec, NULL);
-    if (r < 0) {
-        say("[%s] avcodec_open2('%s') failed: %d (%s)\n", tag, codec->name, r, av_make_error_string(err, sizeof(err), r));
-        avcodec_free_context(&ctx);
-        return NULL;
-    }
+    if (avcodec_parameters_to_context(ctx, st->codecpar) < 0) { avcodec_free_context(&ctx); return NULL; }
+    if (avcodec_open2(ctx, codec, NULL) < 0) { avcodec_free_context(&ctx); return NULL; }
     return ctx;
 }
-
-/* ------------------------------------------------------------------ opening the media */
 
 static int io_read(void *opaque, uint8_t *buf, int size)
 {
@@ -642,75 +577,27 @@ static bool open_media(Player *p)
     char url[600];
     int r;
 
-    /* ---- attempt 1: normal protocol layer, forced to 'file:' */
     snprintf(url, sizeof(url), "file:%s", p->path);
-    say("[%s] avformat_open_input via protocol: %s\n", p->tag, url);
     p->fmt = NULL;
     r = avformat_open_input(&p->fmt, url, NULL, NULL);
-    if (r >= 0) {
-        say("[%s] open OK (protocol layer)\n", p->tag);
-    } else {
-        say("[%s] FAILED avformat_open_input: %d = %s -> %s\n", p->tag, r,
-            av_make_error_string(err, sizeof(err), r), explain_err(r));
+    if (r < 0) {
         p->fmt = NULL;
-
-        /* ---- attempt 2: custom AVIOContext over stdio */
-        say("[%s] retrying with custom AVIOContext (stdio)\n", p->tag);
         p->fp = fopen(p->path, "rb");
-        if (!p->fp) {
-            say("[%s] fopen('%s') FAILED: errno=%d (%s)\n", p->tag, p->path, errno, strerror(errno));
-            return false;
-        }
-        fseek(p->fp, 0, SEEK_END);
-        long fsize = ftell(p->fp);
-        fseek(p->fp, 0, SEEK_SET);
-        unsigned char hdr[12] = {0};
-        size_t hn = fread(hdr, 1, sizeof(hdr), p->fp);
-        fseek(p->fp, 0, SEEK_SET);
-        say("[%s] file size: %ld bytes; first 12 bytes: '%.4s' ... '%.4s'\n", p->tag,
-            fsize, hn >= 4 ? (const char *)hdr : "?", hn >= 12 ? (const char *)hdr + 8 : "?");
-        if (hn < 12 || memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "AVI ", 4) != 0)
-            say("[%s] WARNING: header is not RIFF....AVI  -> not a standard AVI "
-                "(renamed MP4/MKV, or truncated copy)\n", p->tag);
-
+        if (!p->fp) return false;
+        
         const int bufsz = 32768;
         unsigned char *iobuf = (unsigned char *)av_malloc(bufsz);
-        if (!iobuf) { say("[%s] av_malloc failed\n", p->tag); close_media(p); return false; }
         p->pb = avio_alloc_context(iobuf, bufsz, 0, p, io_read, NULL, io_seek);
-        if (!p->pb) { av_free(iobuf); say("[%s] avio_alloc_context failed\n", p->tag); close_media(p); return false; }
-
         p->fmt = avformat_alloc_context();
-        if (!p->fmt) { say("[%s] avformat_alloc_context failed\n", p->tag); close_media(p); return false; }
         p->fmt->pb = p->pb;
         p->fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
 
         r = avformat_open_input(&p->fmt, p->path, NULL, NULL);
-        if (r < 0) {
-            say("[%s] FAILED avformat_open_input (custom AVIO): %d = %s -> %s\n", p->tag, r,
-                av_make_error_string(err, sizeof(err), r), explain_err(r));
-            p->fmt = NULL;
-            close_media(p);
-            return false;
-        }
-        say("[%s] open OK (custom AVIOContext)\n", p->tag);
+        if (r < 0) { p->fmt = NULL; close_media(p); return false; }
     }
-    say("[%s] container: %s (%s)\n", p->tag, p->fmt->iformat->name, p->fmt->iformat->long_name);
 
-    /* ---- stream analysis, checked separately */
     r = avformat_find_stream_info(p->fmt, NULL);
-    if (r < 0) {
-        say("[%s] FAILED avformat_find_stream_info: %d = %s -> %s\n", p->tag, r,
-            av_make_error_string(err, sizeof(err), r), explain_err(r));
-        close_media(p);
-        return false;
-    }
-    say("[%s] %u stream(s), duration %.1f s\n", p->tag, p->fmt->nb_streams,
-        p->fmt->duration != AV_NOPTS_VALUE ? p->fmt->duration / (double)AV_TIME_BASE : -1.0);
-    for (unsigned i = 0; i < p->fmt->nb_streams; i++) {
-        const AVCodecParameters *cp = p->fmt->streams[i]->codecpar;
-        say("[%s]   stream %u: %s %s\n", p->tag, i, av_get_media_type_string(cp->codec_type),
-            avcodec_get_name(cp->codec_id));
-    }
+    if (r < 0) { close_media(p); return false; }
     return true;
 }
 
@@ -720,7 +607,7 @@ static bool player_prepare(Player *p)
 
     p->vi = av_find_best_stream(p->fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     p->ai = av_find_best_stream(p->fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
-    if (p->vi < 0) { say("[%s] No video stream\n", p->tag); return false; }
+    if (p->vi < 0) return false;
 
     p->vst  = p->fmt->streams[p->vi];
     p->vctx = open_decoder(p->tag, p->vst);
@@ -732,17 +619,14 @@ static bool player_prepare(Player *p)
     if (p->want_audio && p->ai >= 0) {
         p->ast  = p->fmt->streams[p->ai];
         p->actx = open_decoder(p->tag, p->ast);
-        if (!p->actx) say("[%s] audio decoder unavailable (playing muted)\n", p->tag);
-    } else if (!p->want_audio && p->ai >= 0) {
-        say("[%s] audio stream present but ignored on purpose (only bottom video has sound)\n", p->tag);
     }
 
     p->vframe = av_frame_alloc();
     p->aframe = av_frame_alloc();
-    if (!p->vframe || !p->aframe) { say("[%s] out of memory\n", p->tag); return false; }
+    if (!p->vframe || !p->aframe) return false;
 
-    if (!pq_init(&p->vq, 1024, 3u << 20)) { say("[%s] out of memory (video queue)\n", p->tag); return false; }
-    if (p->actx && !pq_init(&p->aq, 4096, 1536u << 10)) { say("[%s] out of memory (audio queue)\n", p->tag); return false; }
+    if (!pq_init(&p->vq, 1024, 3u << 20)) return false;
+    if (p->actx && !pq_init(&p->aq, 4096, 1536u << 10)) return false;
 
     p->active = true;
     return true;
@@ -757,15 +641,14 @@ static void reader_thread(void *arg)
     while (pkt && !g_quit) {
         if (av_read_frame(p->fmt, pkt) < 0) break;
         PQ *q = NULL;
-        if (pkt->stream_index == p->vi)                              q = &p->vq;
-        else if (p->audio_on && pkt->stream_index == p->ai)          q = &p->aq;
+        if (pkt->stream_index == p->vi) q = &p->vq;
+        else if (p->audio_on && pkt->stream_index == p->ai) q = &p->aq;
         if (!q) { av_packet_unref(pkt); continue; }
         while (!g_quit && pq_full(q)) svcSleepThread(2000000LL);
         if (g_quit) { av_packet_unref(pkt); break; }
         if (!pq_push(q, pkt)) av_packet_unref(pkt);
     }
     av_packet_free(&pkt);
-    __sync_synchronize();
     p->eof = true;
 }
 
@@ -784,7 +667,6 @@ static void audio_thread(void *arg)
         av_packet_free(&pk);
     }
     if (!g_quit && p->audio_on) handle_audio(p, NULL);
-    __sync_synchronize();
     p->audio_done = true;
 }
 
@@ -798,14 +680,7 @@ static void video_thread(void *arg)
         u64 t0 = osGetTime();
         while (!g_quit && !a->aud_ready && !a->audio_done && osGetTime() - t0 < 3000)
             svcSleepThread(2000000LL);
-        if (!a->aud_ready) {
-            if (a == p) {
-                a->audio_on = false;
-                say("[%s] audio did not start within 3 s - audio disabled, using wall clock\n", p->tag);
-            } else {
-                say("[%s] master audio not ready after 3 s - using wall clock (master audio kept)\n", p->tag);
-            }
-        }
+        if (!a->aud_ready && a == p) a->audio_on = false;
     }
 
     if (p->clock_src) {
@@ -833,7 +708,6 @@ static void video_thread(void *arg)
         av_packet_free(&pk);
     }
     if (!g_quit) handle_video(p, NULL);
-    __sync_synchronize();
     p->video_done = true;
 }
 
@@ -874,17 +748,12 @@ int main(void)
 
     gfxInitDefault();
     gfxSet3D(false);
-
-    /* CONFIGURATION VIDÉO : On force le format BGR8 pour les deux écrans.
-       On le fait AVANT d'initialiser la console pour que la console du haut s'adapte. */
     gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);
     gfxSetScreenFormat(GFX_BOTTOM, GSP_BGR8_OES);
     gfxSetDoubleBuffering(GFX_TOP, false);
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
 
-    /* CONSOLE DE LOG : On met la console sur le HAUT pour ne pas détruire le framebuffer du bas.
-       Le printf() et say() écriront ici pendant le chargement. */
-    consoleInit(GFX_TOP, NULL);
+    consoleInit(GFX_TOP, NULL); /* Console sur le haut */
     consoleClear();
 
     osSetSpeedupEnable(true);
@@ -905,23 +774,31 @@ int main(void)
             legacy = true;
         }
     }
+    
     if (!pl[0].present && !pl[1].present) {
-        say("No top.avi / bot.avi / *.avi found in sdmc:/videos, sdmc:/ or sdmc:/3ds\n");
+        say("No AVI found.\n");
         goto wait_exit;
     }
-    say("Mode: %s\n", legacy ? "single video (no top.avi/bot.avi found)" : "top.avi / bot.avi");
-    if (pl[0].present) say("TOP file: %s\n", pl[0].path);
-    if (pl[1].present) say("BOT file: %s\n", pl[1].path);
 
-    for (int i = 0; i < 2; i++) {
-        if (!pl[i].present) continue;
-        if (!player_prepare(&pl[i])) {
-            say("[%s] could not be prepared - skipped (details above / in log)\n", pl[i].tag);
-            pl[i].active = false;
+    /* --- CHARGEMENT SÉQUENTIEL --- */
+    say("Chargement sequentiel...\n");
+    if (pl[0].present) {
+        say("Preparation TOP...\n");
+        if (!player_prepare(&pl[0])) {
+            say("Echec TOP.\n");
+            pl[0].active = false;
         }
     }
+    if (pl[1].present) {
+        say("Preparation BOT...\n");
+        if (!player_prepare(&pl[1])) {
+            say("Echec BOT.\n");
+            pl[1].active = false;
+        }
+    }
+
     if (!pl[0].active && !pl[1].active) {
-        say("Nothing to play - see details above and in sdmc:/3ds/minivideo_log.txt\n");
+        say("Rien a jouer.\n");
         goto wait_exit;
     }
 
@@ -935,8 +812,6 @@ int main(void)
                 ndspSetOutputMode(NDSP_OUTPUT_STEREO);
                 audio_init_buffers(&ap->au);
                 ap->audio_on = true;
-            } else {
-                say("NDSP init failed (sdmc:/3ds/dspfirm.cdc missing?) - no sound\n");
             }
         }
         if (pl[0].active && pl[1].active && pl[1].audio_on) pl[0].clock_src = &pl[1];
@@ -952,7 +827,6 @@ int main(void)
         if (!n3ds) APT_SetAppCpuTimeLimit(30);
         int wcore = n3ds ? 2 : 1;
         int vcore[2] = { n3ds ? 2 : 0, 0 };
-        bool ok = true;
 
         for (int i = 0; i < 2; i++) {
             Player *p = &pl[i];
@@ -960,10 +834,7 @@ int main(void)
             p->th_reader = make_thread(reader_thread, p, 128 * 1024, wprio, wcore);
             p->th_video  = make_thread(video_thread,  p, 512 * 1024, prio,  vcore[i]);
             if (p->audio_on) p->th_audio = make_thread(audio_thread, p, 256 * 1024, wprio, wcore);
-            if (!p->th_reader || !p->th_video || (p->audio_on && !p->th_audio)) ok = false;
         }
-        if (!ok) { say("threadCreate failed (cannot run pipeline)\n"); goto wait_exit; }
-        say("threads started (%s)\n", n3ds ? "New 3DS family" : "Old 3DS");
     }
 
     {
@@ -983,22 +854,16 @@ int main(void)
                 bool vok = pq_count(&p->vq) >= pre || p->eof || pq_full(&p->vq);
                 bool aok = !p->audio_on || pq_count(&p->aq) > 0 || p->eof;
                 if (!(vok && aok)) all_ok = false;
-                /* Affichage de chargement sur le HAUT */
                 printf("\x1b[%d;1H%s buffering %3d/%3d   ", 27 + i, p->tag, pq_count(&p->vq), pre);
             }
             fflush(stdout);
             if (all_ok) break;
-            if (osGetTime() - tb0 > 10000) { say("\nprebuffer timeout (10 s)\n"); break; }
+            if (osGetTime() - tb0 > 10000) break;
             svcSleepThread(20000000LL);
         }
-        say("\nPrebuffered in %u ms\n", (unsigned)(osGetTime() - tb0));
-        for (int i = 0; i < 2; i++)
-            if (pl[i].active)
-                say("[%s] queue: video %d pkts (%u KB), audio %d pkts\n", pl[i].tag,
-                    pq_count(&pl[i].vq), (unsigned)(pq_bytes(&pl[i].vq) >> 10), pq_count(&pl[i].aq));
     }
 
-    /* Dès que la lecture commence, on cache le texte pour ne pas gêner la vidéo */
+    /* Cacher le texte pour ne pas écraser les framebuffers */
     if (!g_quit) {
         g_quiet = true;
         consoleClear(); 
@@ -1008,7 +873,7 @@ int main(void)
     for (int i = 0; i < 2; i++) pl[i].go = true;
 
     {
-        u64 tstat = osGetTime(), tlog = tstat, pause_start = 0;
+        u64 pause_start = 0;
         while (!g_quit) {
             if (!aptMainLoop()) { g_quit = true; break; }
             hidScanInput();
@@ -1036,19 +901,6 @@ int main(void)
             }
             if (done) break;
 
-            u64 now = osGetTime();
-            if (now - tstat >= 1000) {
-                tstat = now;
-                if (now - tlog >= 5000) {
-                    tlog = now;
-                    for (int i = 0; i < 2; i++) {
-                        Player *p = &pl[i];
-                        if (!p->active) continue;
-                        say("[%s] V queue:%d A queue:%d shown:%d dropped:%d starved:%d\n", p->tag,
-                            pq_count(&p->vq), pq_count(&p->aq), p->shown, p->dropped, p->underruns);
-                    }
-                }
-            }
             svcSleepThread(16000000LL);
         }
     }
@@ -1071,11 +923,7 @@ int main(void)
         g_quiet = false;
         consoleClear();
     }
-    for (int i = 0; i < 2; i++)
-        if (pl[i].active)
-            say("[%s] end: shown=%d dropped=%d starved=%d times\n", pl[i].tag,
-                pl[i].shown, pl[i].dropped, pl[i].underruns);
-    if (!g_quit) say("End of playback. START to exit\n");
+    if (!g_quit) say("Fin. START pour quitter.\n");
 
 wait_exit:
     while (!g_quit && aptMainLoop()) {
