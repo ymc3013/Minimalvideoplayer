@@ -29,10 +29,9 @@
 #define AUDIO_BUFFER_COUNT 4
 
 #define IO_BUFFER_SIZE 32768
-#define PRELOAD_AUDIO_BUFFERS 2
 
 static ndspWaveBuf audioBuffers[AUDIO_BUFFER_COUNT];
-static int16_t *audioMemory[AUDIO_BUFFER_COUNT];
+static int16_t *audioMemory[AUDIO_BUFFER_COUNT] = {0};
 static int audioIndex = 0;
 static int ndspStarted = 0;
 
@@ -51,15 +50,10 @@ static int read_file_packet(
 {
     FILE *file = (FILE *)opaque;
 
-    if (buffer_size <= 0)
+    if (!file || buffer_size <= 0)
         return AVERROR(EINVAL);
 
-    size_t count = fread(
-        buffer,
-        1,
-        (size_t)buffer_size,
-        file
-    );
+    size_t count = fread(buffer, 1, (size_t)buffer_size, file);
 
     if (count > 0)
         return (int)count;
@@ -76,11 +70,15 @@ static int64_t seek_file_packet(
     int whence)
 {
     FILE *file = (FILE *)opaque;
+
+    if (!file)
+        return AVERROR(EINVAL);
+
     long current;
     long end;
     int origin;
 
-    if (whence == AVSEEK_SIZE) {
+    if (whence & AVSEEK_SIZE) {
         current = ftell(file);
 
         if (current < 0)
@@ -106,15 +104,12 @@ static int64_t seek_file_packet(
     case SEEK_SET:
         origin = SEEK_SET;
         break;
-
     case SEEK_CUR:
         origin = SEEK_CUR;
         break;
-
     case SEEK_END:
         origin = SEEK_END;
         break;
-
     default:
         return AVERROR(EINVAL);
     }
@@ -141,12 +136,13 @@ static void show_error(const char *message, int error)
 {
     char text[AV_ERROR_MAX_STRING_SIZE];
 
-    av_strerror(error, text, sizeof(text));
+    if (av_strerror(error, text, sizeof(text)) < 0)
+        snprintf(text, sizeof(text), "Erreur inconnue (%d)", error);
 
     consoleInit(GFX_TOP, NULL);
 
-    printf("%s\n%s\n", message, text);
-    printf("\nSTART pour quitter.");
+    printf("%s\n\n%s\n", message, text);
+    printf("\nAppuie sur START pour quitter.");
 
     while (aptMainLoop()) {
         hidScanInput();
@@ -159,22 +155,17 @@ static void show_error(const char *message, int error)
 }
 
 /* ---------------------------------------------------------
-   Synchronisation des images vidéo
+   Synchronisation vidéo
    --------------------------------------------------------- */
 
 static void wait_until_us(int64_t targetUs)
 {
     while (aptMainLoop()) {
-        int64_t now = av_gettime_relative();
-        int64_t remaining = targetUs - now;
+        int64_t remaining = targetUs - av_gettime_relative();
 
         if (remaining <= 0)
             break;
 
-        /*
-         * Sommeil court pour laisser du temps au processeur.
-         * svcSleepThread utilise des nanosecondes.
-         */
         if (remaining > 3000)
             svcSleepThread(1000000);
         else
@@ -182,9 +173,7 @@ static void wait_until_us(int64_t targetUs)
     }
 }
 
-static void pace_video_frame(
-    AVFrame *frame,
-    AVStream *stream)
+static void pace_video_frame(AVFrame *frame, AVStream *stream)
 {
     int64_t now = av_gettime_relative();
 
@@ -201,36 +190,66 @@ static void pace_video_frame(
     if (frame->best_effort_timestamp != AV_NOPTS_VALUE &&
         firstVideoPts != AV_NOPTS_VALUE) {
 
-        int64_t frameOffsetUs = av_rescale_q(
+        int64_t offsetUs = av_rescale_q(
             frame->best_effort_timestamp - firstVideoPts,
             stream->time_base,
             AV_TIME_BASE_Q
         );
 
-        wait_until_us(playbackStartUs + frameOffsetUs);
+        wait_until_us(playbackStartUs + offsetUs);
     }
 }
 
 /* ---------------------------------------------------------
-   Affichage vidéo
+   Affichage vidéo corrigé
    --------------------------------------------------------- */
 
-static void display_frame(
-    struct SwsContext *scaler,
+static int display_frame(
+    struct SwsContext **scaler,
     AVFrame *frame,
-    uint8_t *rgb,
-    int rgbStride)
+    uint8_t *pixels,
+    int stride)
 {
+    if (!scaler || !frame || !pixels)
+        return AVERROR(EINVAL);
+
+    if (frame->width <= 0 || frame->height <= 0)
+        return AVERROR_INVALIDDATA;
+
+    /*
+     * Le format réel est lu sur chaque frame.
+     * Le convertisseur est recréé automatiquement si nécessaire.
+     *
+     * BGR24 correspond à l'ordre des couleurs du framebuffer
+     * par défaut de libctru : GSP_BGR8_OES.
+     */
+    *scaler = sws_getCachedContext(
+        *scaler,
+        frame->width,
+        frame->height,
+        (enum AVPixelFormat)frame->format,
+        SCREEN_W,
+        SCREEN_H,
+        AV_PIX_FMT_BGR24,
+        SWS_BILINEAR,
+        NULL,
+        NULL,
+        NULL
+    );
+
+    if (!*scaler)
+        return AVERROR(ENOMEM);
+
     uint8_t *destData[4] = {
-        rgb, NULL, NULL, NULL
+        pixels, NULL, NULL, NULL
     };
 
     int destStride[4] = {
-        rgbStride, 0, 0, 0
+        stride, 0, 0, 0
     };
 
     int rows = sws_scale(
-        scaler,
+        *scaler,
         (const uint8_t * const *)frame->data,
         frame->linesize,
         0,
@@ -239,66 +258,66 @@ static void display_frame(
         destStride
     );
 
-    if (rows <= 0)
-        return;
+    if (rows != SCREEN_H)
+        return AVERROR_INVALIDDATA;
 
-    u16 width = 0;
-    u16 height = 0;
+    u16 fbWidth = 0;
+    u16 fbHeight = 0;
 
     u8 *fb = gfxGetFramebuffer(
         GFX_TOP,
         GFX_LEFT,
-        &width,
-        &height
+        &fbWidth,
+        &fbHeight
     );
 
-    if (!fb || width != FB_WIDTH || height != FB_HEIGHT)
-        return;
+    if (!fb)
+        return AVERROR_EXTERNAL;
+
+    if (fbWidth != FB_WIDTH || fbHeight != FB_HEIGHT)
+        return AVERROR_INVALIDDATA;
 
     /*
-     * L'image convertie fait 400 x 240.
-     * Le framebuffer est organisé en 240 x 400.
+     * L'image décodée fait 400 x 240.
+     * Le framebuffer est orienté latéralement et fait 240 x 400.
      *
-     * Chaque pixel est écrit en BGR.
+     * Indice en pixels :
+     *     x * 240 + (239 - y)
+     *
+     * Chaque pixel occupe trois octets B, G, R.
      */
     for (int y = 0; y < SCREEN_H; y++) {
         for (int x = 0; x < SCREEN_W; x++) {
-            const uint8_t *pixel =
-                &rgb[y * rgbStride + x * 3];
+            const uint8_t *src =
+                &pixels[(size_t)y * stride + (size_t)x * 3];
 
-            unsigned int pos =
-                (unsigned int)x * FB_WIDTH
-                + (FB_WIDTH - 1 - y);
+            size_t pos =
+                ((size_t)x * FB_WIDTH + (FB_WIDTH - 1 - y)) * 3;
 
-            pos *= 3;
-
-            fb[pos + 0] = pixel[2];
-            fb[pos + 1] = pixel[1];
-            fb[pos + 2] = pixel[0];
+            fb[pos]     = src[0];
+            fb[pos + 1] = src[1];
+            fb[pos + 2] = src[2];
         }
     }
 
     gfxFlushBuffers();
     gfxSwapBuffers();
     gspWaitForVBlank();
+
+    return 0;
 }
 
 /* ---------------------------------------------------------
-   Audio : buffers NDSP
+   Audio NDSP
    --------------------------------------------------------- */
 
-static int queue_audio(
-    const int16_t *data,
-    int samples)
+static int queue_audio(const int16_t *data, int samples)
 {
     if (!data || samples <= 0)
         return 0;
 
     int offset = 0;
 
-    /*
-     * Découpe les données en blocs de taille sûre.
-     */
     while (offset < samples && aptMainLoop()) {
         int count = samples - offset;
 
@@ -307,9 +326,6 @@ static int queue_audio(
 
         ndspWaveBuf *buf = &audioBuffers[audioIndex];
 
-        /*
-         * Ne jamais écraser un buffer encore utilisé par NDSP.
-         */
         while (aptMainLoop() &&
                (buf->status == NDSP_WBUF_QUEUED ||
                 buf->status == NDSP_WBUF_PLAYING)) {
@@ -317,12 +333,10 @@ static int queue_audio(
         }
 
         if (!aptMainLoop())
-            return -1;
+            return AVERROR_EXIT;
 
         size_t bytes =
-            (size_t)count *
-            AUDIO_CHANNELS *
-            sizeof(int16_t);
+            (size_t)count * AUDIO_CHANNELS * sizeof(int16_t);
 
         memcpy(
             audioMemory[audioIndex],
@@ -336,11 +350,7 @@ static int queue_audio(
         buf->nsamples = count;
         buf->looping = false;
 
-        DSP_FlushDataCache(
-            audioMemory[audioIndex],
-            bytes
-        );
-
+        DSP_FlushDataCache(audioMemory[audioIndex], bytes);
         ndspChnWaveBufAdd(0, buf);
 
         audioIndex = (audioIndex + 1) % AUDIO_BUFFER_COUNT;
@@ -351,7 +361,7 @@ static int queue_audio(
 }
 
 /* ---------------------------------------------------------
-   Préparation et lecture
+   Programme principal
    --------------------------------------------------------- */
 
 int main(void)
@@ -366,37 +376,33 @@ int main(void)
     AVFrame *videoFrame = NULL;
     AVFrame *audioFrame = NULL;
 
-    SwsContext *scaler = NULL;
+    struct SwsContext *scaler = NULL;
     SwrContext *resampler = NULL;
 
     FILE *videoFile = NULL;
 
-    uint8_t *rgb = NULL;
+    uint8_t *pixels = NULL;
     uint8_t *audioConverted = NULL;
+    uint8_t *ioBuffer = NULL;
 
     int videoStream = -1;
     int audioStream = -1;
     int result = 0;
+    int errorOccurred = 0;
 
-    /*
-     * Initialisation de l'écran et affichage du chargement.
-     */
     gfxInitDefault();
     gfxSet3D(false);
 
     consoleInit(GFX_TOP, NULL);
     printf("Minimal Video Player\n\n");
-    printf("Chargement de la video...\n");
-    printf("Ouverture du fichier AVI...\n");
+    printf("Preparation de la video AVI...\n");
     printf("Veuillez patienter.");
 
     gfxFlushBuffers();
     gfxSwapBuffers();
     gspWaitForVBlank();
 
-    /*
-     * Allocation des buffers audio.
-     */
+    /* Allocation des buffers audio. */
     for (int i = 0; i < AUDIO_BUFFER_COUNT; i++) {
         audioMemory[i] = linearAlloc(
             AUDIO_BUFFER_SAMPLES *
@@ -417,7 +423,7 @@ int main(void)
             sizeof(int16_t)
         );
 
-        memset(&audioBuffers[i], 0, sizeof(ndspWaveBuf));
+        memset(&audioBuffers[i], 0, sizeof(audioBuffers[i]));
     }
 
     if (ndspInit() != 0) {
@@ -433,10 +439,7 @@ int main(void)
     ndspChnSetRate(0, AUDIO_RATE);
     ndspChnSetFormat(0, NDSP_FORMAT_STEREO_PCM16);
 
-    /*
-     * Ouvre le fichier sans demander à FFmpeg de traiter
-     * "sdmc:" comme un protocole réseau.
-     */
+    /* Ouverture du fichier AVI depuis la carte SD. */
     videoFile = fopen(VIDEO_PATH, "rb");
 
     if (!videoFile) {
@@ -444,7 +447,7 @@ int main(void)
         goto error;
     }
 
-    uint8_t *ioBuffer = av_malloc(IO_BUFFER_SIZE);
+    ioBuffer = av_malloc(IO_BUFFER_SIZE);
 
     if (!ioBuffer) {
         result = AVERROR(ENOMEM);
@@ -463,9 +466,12 @@ int main(void)
 
     if (!customIO) {
         av_free(ioBuffer);
+        ioBuffer = NULL;
         result = AVERROR(ENOMEM);
         goto error;
     }
+
+    ioBuffer = NULL; /* Le buffer appartient désormais à customIO. */
 
     format = avformat_alloc_context();
 
@@ -477,24 +483,17 @@ int main(void)
     format->pb = customIO;
     format->flags |= AVFMT_FLAG_CUSTOM_IO;
 
-    result = avformat_open_input(
-        &format,
-        NULL,
-        NULL,
-        NULL
-    );
+    result = avformat_open_input(&format, NULL, NULL, NULL);
 
     if (result < 0)
         goto error;
 
-    /*
-     * FFmpeg analyse les pistes avant le début de la lecture.
-     */
     result = avformat_find_stream_info(format, NULL);
 
     if (result < 0)
         goto error;
 
+    /* Recherche des pistes audio et vidéo. */
     for (unsigned int i = 0; i < format->nb_streams; i++) {
         AVStream *stream = format->streams[i];
 
@@ -514,9 +513,7 @@ int main(void)
         goto error;
     }
 
-    /*
-     * Initialise le décodeur vidéo.
-     */
+    /* Initialisation du décodeur vidéo. */
     {
         AVCodecParameters *params =
             format->streams[videoStream]->codecpar;
@@ -536,10 +533,7 @@ int main(void)
             goto error;
         }
 
-        result = avcodec_parameters_to_context(
-            videoCodec,
-            params
-        );
+        result = avcodec_parameters_to_context(videoCodec, params);
 
         if (result < 0)
             goto error;
@@ -553,29 +547,12 @@ int main(void)
     }
 
     /*
-     * Conversion de la résolution source vers 400 x 240.
+     * Allocation du buffer vidéo.
+     * Le convertisseur sera initialisé à partir de la première frame.
      */
-    scaler = sws_getContext(
-        videoCodec->width,
-        videoCodec->height,
-        videoCodec->pix_fmt,
-        SCREEN_W,
-        SCREEN_H,
-        AV_PIX_FMT_RGB24,
-        SWS_BILINEAR,
-        NULL,
-        NULL,
-        NULL
-    );
+    pixels = malloc((size_t)SCREEN_W * SCREEN_H * 3);
 
-    if (!scaler) {
-        result = AVERROR(ENOMEM);
-        goto error;
-    }
-
-    rgb = malloc(SCREEN_W * SCREEN_H * 3);
-
-    if (!rgb) {
+    if (!pixels) {
         result = AVERROR(ENOMEM);
         goto error;
     }
@@ -589,9 +566,7 @@ int main(void)
         goto error;
     }
 
-    /*
-     * Initialise le décodeur audio si une piste existe.
-     */
+    /* Initialisation facultative du décodeur audio. */
     if (audioStream >= 0) {
         AVCodecParameters *params =
             format->streams[audioStream]->codecpar;
@@ -608,13 +583,8 @@ int main(void)
                     params
                 );
 
-                if (result >= 0) {
-                    result = avcodec_open2(
-                        audioCodec,
-                        decoder,
-                        NULL
-                    );
-                }
+                if (result >= 0)
+                    result = avcodec_open2(audioCodec, decoder, NULL);
 
                 if (result < 0) {
                     avcodec_free_context(&audioCodec);
@@ -628,9 +598,12 @@ int main(void)
 
                 AVChannelLayout inputLayout = {0};
 
-                if (av_channel_layout_copy(
-                        &inputLayout,
-                        &audioCodec->ch_layout) < 0) {
+                int layoutResult = av_channel_layout_copy(
+                    &inputLayout,
+                    &audioCodec->ch_layout
+                );
+
+                if (layoutResult < 0) {
                     av_channel_layout_default(
                         &inputLayout,
                         audioCodec->ch_layout.nb_channels > 0
@@ -665,19 +638,16 @@ int main(void)
         }
     }
 
-    /*
-     * L'initialisation est terminée : la lecture commence
-     * uniquement après la préparation des décodeurs.
-     */
+    /* Début de lecture après la préparation des décodeurs. */
     gfxFlushBuffers();
     gfxSwapBuffers();
     gspWaitForVBlank();
 
-    /*
-     * Boucle principale.
-     */
-    while (aptMainLoop() &&
-           av_read_frame(format, packet) >= 0) {
+    while (aptMainLoop()) {
+        result = av_read_frame(format, packet);
+
+        if (result < 0)
+            break;
 
         hidScanInput();
 
@@ -690,36 +660,46 @@ int main(void)
             result = avcodec_send_packet(videoCodec, packet);
 
             if (result >= 0) {
-                while (avcodec_receive_frame(
-                           videoCodec,
-                           videoFrame) >= 0) {
+                while ((result = avcodec_receive_frame(
+                            videoCodec,
+                            videoFrame)) >= 0) {
 
                     pace_video_frame(
                         videoFrame,
                         format->streams[videoStream]
                     );
 
-                    display_frame(
-                        scaler,
+                    result = display_frame(
+                        &scaler,
                         videoFrame,
-                        rgb,
+                        pixels,
                         SCREEN_W * 3
                     );
 
                     av_frame_unref(videoFrame);
+
+                    if (result < 0) {
+                        errorOccurred = 1;
+                        break;
+                    }
+                }
+
+                if (result != AVERROR(EAGAIN) &&
+                    result != AVERROR_EOF &&
+                    result < 0 && !errorOccurred) {
+                    errorOccurred = 1;
                 }
             }
         }
-        else if (audioCodec &&
-                 resampler &&
+        else if (audioCodec && resampler &&
                  packet->stream_index == audioStream) {
 
             result = avcodec_send_packet(audioCodec, packet);
 
             if (result >= 0) {
-                while (avcodec_receive_frame(
-                           audioCodec,
-                           audioFrame) >= 0) {
+                while ((result = avcodec_receive_frame(
+                            audioCodec,
+                            audioFrame)) >= 0) {
 
                     int capacity = (int)av_rescale_rnd(
                         swr_get_delay(
@@ -732,20 +712,21 @@ int main(void)
                     );
 
                     if (capacity > 0) {
-                        audioConverted = malloc(
+                        size_t bytes =
                             (size_t)capacity *
                             AUDIO_CHANNELS *
-                            sizeof(int16_t)
-                        );
+                            sizeof(int16_t);
+
+                        audioConverted = malloc(bytes);
 
                         if (audioConverted) {
-                            uint8_t *out[] = {
+                            uint8_t *outData[1] = {
                                 audioConverted
                             };
 
                             int converted = swr_convert(
                                 resampler,
-                                out,
+                                outData,
                                 capacity,
                                 (const uint8_t **)
                                     audioFrame->extended_data,
@@ -753,10 +734,11 @@ int main(void)
                             );
 
                             if (converted > 0) {
-                                queue_audio(
-                                    (const int16_t *)audioConverted,
-                                    converted
-                                );
+                                if (queue_audio(
+                                        (const int16_t *)audioConverted,
+                                        converted) < 0) {
+                                    errorOccurred = 1;
+                                }
                             }
 
                             free(audioConverted);
@@ -765,16 +747,26 @@ int main(void)
                     }
 
                     av_frame_unref(audioFrame);
+
+                    if (errorOccurred)
+                        break;
                 }
             }
         }
 
         av_packet_unref(packet);
+
+        if (errorOccurred)
+            break;
     }
 
-    /*
-     * Attend la fin du son déjà envoyé à NDSP avant de quitter.
-     */
+    if (errorOccurred) {
+        if (result >= 0)
+            result = AVERROR_INVALIDDATA;
+        goto error;
+    }
+
+    /* Attend la fin du son déjà transmis à NDSP. */
     if (ndspStarted) {
         int pending;
 
@@ -802,7 +794,8 @@ error:
 
 cleanup:
     free(audioConverted);
-    free(rgb);
+    free(pixels);
+    av_free(ioBuffer);
 
     sws_freeContext(scaler);
     swr_free(&resampler);
@@ -828,13 +821,13 @@ cleanup:
         ndspExit();
 
     for (int i = 0; i < AUDIO_BUFFER_COUNT; i++) {
-        if (audioMemory[i])
+        if (audioMemory[i]) {
             linearFree(audioMemory[i]);
-
-        audioMemory[i] = NULL;
+            audioMemory[i] = NULL;
+        }
     }
 
     gfxExit();
 
-    return 0;
+    return errorOccurred ? 1 : 0;
 }
