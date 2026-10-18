@@ -35,20 +35,9 @@ jobs:
           command -v arm-none-eabi-gcc
           command -v make
 
-          if [ -z "${DEVKITPRO:-}" ]; then
-            echo "::error::DEVKITPRO is not defined in this container."
-            exit 1
-          fi
-
-          if [ -z "${DEVKITARM:-}" ]; then
-            echo "::error::DEVKITARM is not defined in this container."
-            exit 1
-          fi
-
-          if [ ! -f "$DEVKITARM/3ds_rules" ]; then
-            echo "::error::Cannot find $DEVKITARM/3ds_rules"
-            exit 1
-          fi
+          test -n "${DEVKITPRO:-}"
+          test -n "${DEVKITARM:-}"
+          test -f "$DEVKITARM/3ds_rules"
 
           echo "DEVKITPRO=$DEVKITPRO"
           echo "DEVKITARM=$DEVKITARM"
@@ -60,10 +49,7 @@ jobs:
 
           find_library() {
             name="$1"
-            result="$(find "$DEVKITPRO" \
-              -type f \
-              -name "$name" \
-              -print -quit)"
+            result="$(find "$DEVKITPRO" -type f -name "$name" -print -quit)"
 
             if [ -z "$result" ]; then
               echo "::error::Cannot find SDK library $name"
@@ -76,12 +62,10 @@ jobs:
           CTRU_DIR="$(find_library libctru.a)"
           CITRO2D_DIR="$(find_library libcitro2d.a)"
           CITRO3D_DIR="$(find_library libcitro3d.a)"
-
           ZLIB_DIR="$DEVKITPRO/portlibs/3ds/lib"
 
           if [ ! -s "$ZLIB_DIR/libz.a" ]; then
             echo "::error::3DS zlib library not found: $ZLIB_DIR/libz.a"
-            find "$DEVKITPRO" -type f -name libz.a -print
             exit 1
           fi
 
@@ -91,11 +75,6 @@ jobs:
             echo "SDK_CITRO3D_DIR=$CITRO3D_DIR"
             echo "SDK_ZLIB_DIR=$ZLIB_DIR"
           } >> "$GITHUB_ENV"
-
-          echo "libctru: $CTRU_DIR"
-          echo "libcitro2d: $CITRO2D_DIR"
-          echo "libcitro3d: $CITRO3D_DIR"
-          echo "zlib: $ZLIB_DIR"
 
       - name: Verify decoder libraries
         shell: bash
@@ -154,16 +133,16 @@ jobs:
           make clean
           make -j2 V=1
 
-          if [ ! -s Minimalvideoplayer.3dsx ]; then
-            echo "::error::Minimalvideoplayer.3dsx was not created."
-            exit 1
-          fi
+          test -s Minimalvideoplayer.elf
+          test -s Minimalvideoplayer.3dsx
 
-          ls -lh Minimalvideoplayer.3dsx
+          ls -lh Minimalvideoplayer.elf Minimalvideoplayer.3dsx
 
-      - name: Upload 3DSX artifact
+      - name: Upload build files for debugging
         uses: actions/upload-artifact@v4
         with:
-          name: Minimalvideoplayer-3dsx
-          path: Minimalvideoplayer.3dsx
+          name: Minimalvideoplayer-debug
+          path: |
+            Minimalvideoplayer.elf
+            Minimalvideoplayer.3dsx
           if-no-files-found: error
