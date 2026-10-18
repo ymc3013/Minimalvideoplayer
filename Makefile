@@ -1,4 +1,3 @@
-
 .SUFFIXES:
 
 ifeq ($(strip $(DEVKITARM)),)
@@ -29,6 +28,14 @@ CFLAGS := -O2 -Wall -mword-relocations -ffunction-sections $(ARCH)
 CFLAGS += -D__3DS__ -U__STRICT_ANSI__ -std=gnu11
 CFLAGS += $(foreach dir,$(INCLUDES),-I$(dir))
 
+# Add explicit system library search directories (devkitPro)
+# This helps the linker find libctru.a, libcitro2d.a, libcitro3d.a and libz.a
+SYSTEM_LIBDIRS := \
+	-L$(DEVKITPRO)/libctru/lib \
+	-L$(DEVKITPRO)/citro2d/lib \
+	-L$(DEVKITPRO)/citro3d/lib \
+	-L$(DEVKITPRO)/libz/lib
+
 LDFLAGS := -specs=3dsx.specs $(ARCH) -Wl,--gc-sections
 
 # Bibliothèques principales du décodeur.
@@ -51,8 +58,8 @@ EXTRA_LIBS := \
 	$(DECODER_LIBDIR)/libmbedcrypto.a
 
 # Bibliothèques du SDK devkitPro.
-# Ne pas ajouter -L$(DECODER_LIBDIR) : cela pourrait sélectionner
-# une ancienne copie de libctru.a ou libz.a.
+# Nous ajoutons explicitement des -L vers les répertoires système (SYSTEM_LIBDIRS)
+# pour forcer l'utilisation des bibliothèques installées via dkp-pacman.
 SYSTEM_LIBS := -lcitro2d -lcitro3d -lctru -lm -lc -lz
 
 CFILES := $(notdir $(wildcard $(SOURCES)/*.c))
@@ -80,6 +87,7 @@ $(BUILD)/%.o: $(SOURCES)/%.c | $(BUILD)
 $(TARGET).elf: $(OFILES) | check-libs
 	$(CC) $(LDFLAGS) -o $@ $(OFILES) \
 		-Wl,--start-group \
+		$(SYSTEM_LIBDIRS) \
 		$(DECODER_LIBS) \
 		$(EXTRA_LIBS) \
 		$(SYSTEM_LIBS) \
