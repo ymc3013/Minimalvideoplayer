@@ -7,7 +7,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     container:
       image: devkitpro/devkitarm:latest
 
@@ -15,30 +14,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Prepare dependencies
+      - name: Prepare FFmpeg libraries
         shell: bash
         run: |
           set -eux
-
           git clone --depth 1 \
             https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
             /tmp/3ds-reference
 
           mkdir -p library/include library/lib source
-
           cp -a /tmp/3ds-reference/library/include/. library/include/
           cp -a /tmp/3ds-reference/library/lib/. library/lib/
-
           rm -f library/lib/libctru.a
 
-      - name: Verify required files
-        shell: bash
+      - name: Verify source files
         run: |
-          set -eux
           test -s source/main.c
           test -s Makefile
-          test -d library/include
-          test -d library/lib
+          grep -q 'include.*3ds_rules' Makefile
 
       - name: Build application
         shell: bash
@@ -46,7 +39,6 @@ jobs:
           set -eux
           export DEVKITPRO=/opt/devkitpro
           export DEVKITARM=/opt/devkitpro/devkitARM
-
           make clean
           make
 
