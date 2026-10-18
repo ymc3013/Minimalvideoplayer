@@ -1,20 +1,20 @@
-
-name: Import libraries and build player
+name: Build Minimalvideoplayer
 
 on:
-  workflow_dispatch:
   push:
     paths:
-      - ".github/workflows/build.yml"
-      - "Makefile"
-      - "source/**"
-      - "third_party/decoder/**"
+      - '.github/workflows/build.yml'
+      - 'Makefile'
+      - 'source/**'
+      - 'third_party/decoder/**'
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
+    name: Build 3DSX
     runs-on: ubuntu-latest
     container:
       image: devkitpro/devkitarm:latest
@@ -22,104 +22,95 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          persist-credentials: true
 
-      - name: Import upstream libraries if missing
+      - name: Configure devkitPro environment
         shell: bash
         run: |
-          set -euo pipefail
+          set -eu
+          echo "DEVKITPRO=${DEVKITPRO:-unset}"
+          echo "DEVKITARM=${DEVKITARM:-unset}"
 
-          if [ ! -d third_party/decoder/include ] ||
-             [ ! -d third_party/decoder/lib ]; then
-            git clone --depth 1 \
-              https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
-              /tmp/video-reference
+          test -n "${DEVKITPRO:-}" || {
+            echo "::error::DEVKITPRO is not configured."
+            exit 1
+          }
 
-            mkdir -p third_party/decoder
+          test -n "${DEVKITARM:-}" || {
+            echo "::error::DEVKITARM is not configured."
+            exit 1
+          }
 
-            cp -a /tmp/video-reference/library/include \
-              third_party/decoder/include
+          export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
+          echo "$DEVKITARM/bin" >> "$GITHUB_PATH"
+          echo "$DEVKITPRO/tools/bin" >> "$GITHUB_PATH"
 
-            cp -a /tmp/video-reference/library/lib \
-              third_party/decoder/lib
-
-            cp /tmp/video-reference/LICENSE \
-              third_party/decoder/UPSTREAM_LICENSE.txt
+          if command -v arm-none-eabi-gcc >/dev/null 2>&1; then
+            arm-none-eabi-gcc --version
+          elif [ -x "$DEVKITARM/bin/arm-none-eabi-gcc" ]; then
+            "$DEVKITARM/bin/arm-none-eabi-gcc" --version
+          else
+            echo "::error::ARM compiler not found."
+            find "$DEVKITPRO" -name arm-none-eabi-gcc -print || true
+            exit 1
           fi
 
-      - name: Prepare library linker aliases
-        shell: bash
-        run: |
-          set -euo pipefail
-          LIB="third_party/decoder/lib"
-
-          # Keep the original files; create aliases only if needed.
-          if [ ! -e "$LIB/libavutil.a" ] &&
-             [ -f "$LIB/lubavutil.a" ]; then
-            ln -s lubavutil.a "$LIB/libavutil.a"
-          fi
-
-          if [ ! -e "$LIB/libnghttp2.a" ] &&
-             [ -f "$LIB/libnghttp2." ]; then
-            ln -s 'libnghttp2.' "$LIB/libnghttp2.a"
-          fi
-
-          echo "Available libraries:"
-          find "$LIB" -maxdepth 1 -type f -printf '%f\n' | sort
-
-      - name: Verify toolchain and source files
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          test -f source/main.c
-          test -f source/video.c
-          test -f source/video.h
-          test -f source/audio.c
-          test -f source/audio.h
-          test -f source/avi.c
-          test -f source/avi.h
-          test -f Makefile
-
-          echo "DEVKITPRO=${DEVKITPRO:-not set}"
-          echo "DEVKITARM=${DEVKITARM:-not set}"
-          test -n "${DEVKITARM:-}"
           make --version
-          arm-none-eabi-gcc --version
 
-      - name: Build 3DSX
+      - name: Verify project files
         shell: bash
         run: |
-          set -euo pipefail
+          set -eu
+
+          test -f Makefile || {
+            echo "::error::Makefile missing."
+            exit 1
+          }
+
+          test -f source/main.c || {
+            echo "::error::source/main.c missing."
+            exit 1
+          }
+
+          for file in \
+            third_party/decoder/include/libavformat/avformat.h \
+            third_party/decoder/include/libavcodec/avcodec.h \
+            third_party/decoder/lib/libavformat.a \
+            third_party/decoder/lib/libavcodec.a \
+            third_party/decoder/lib/libswscale.a \
+            third_party/decoder/lib/libswresample.a
+          do
+            test -f "$file" || {
+              echo "::error::Missing dependency: $file"
+              exit 1
+            }
+          done
+
+          if [ ! -f third_party/decoder/lib/libavutil.a ]; then
+            if [ -f third_party/decoder/lib/lubavutil.a ]; then
+              ln -s lubavutil.a third_party/decoder/lib/libavutil.a
+            else
+              echo "::error::Missing libavutil.a and lubavutil.a"
+              exit 1
+            fi
+          fi
+
+          echo "Project files verified."
+
+      - name: Build Minimalvideoplayer
+        shell: bash
+        run: |
+          set -eu
+          export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
+
           make clean
-          make -j2 3dsx
+          make -j2
 
           test -s Minimalvideoplayer.3dsx
+          ls -lh Minimalvideoplayer.3dsx
 
       - name: Upload 3DSX artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Minimalvideoplayer-3DSX
+          name: Minimalvideoplayer-3dsx
           path: Minimalvideoplayer.3dsx
           if-no-files-found: error
-
-      - name: Commit imported libraries
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          git config user.name "github-actions[bot]"
-          git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add third_party/decoder
-
-          if git diff --cached --quiet; then
-            echo "No library changes to commit."
-            exit 0
-          fi
-
-          git commit -m "Import video decoding libraries"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
