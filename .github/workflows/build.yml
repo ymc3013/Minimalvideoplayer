@@ -25,32 +25,38 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Nintendo 3DS SDK
+      - name: Install devkitPro SDK and libraries
         shell: bash
         run: |
           set -eu
 
+          export PATH="/opt/devkitpro/devkitARM/bin:/opt/devkitpro/tools/bin:$PATH"
+
           if ! command -v dkp-pacman >/dev/null 2>&1; then
-            echo "::error::devkitPro package manager is unavailable."
+            echo "::error::dkp-pacman is unavailable in the container."
             exit 1
           fi
 
           dkp-pacman -Sy --noconfirm
-          dkp-pacman -S --needed --noconfirm 3ds-dev 3ds-zlib
+          dkp-pacman -S --needed --noconfirm \
+            devkitARM \
+            3ds-dev \
+            citro2d \
+            citro3d \
+            libctru
+
+          echo "=== Installed SDK ==="
+          echo "DEVKITPRO=$DEVKITPRO"
+          echo "DEVKITARM=$DEVKITARM"
+          arm-none-eabi-gcc --version
+          make --version
 
       - name: Locate SDK libraries
         shell: bash
         run: |
           set -eu
 
-          echo "DEVKITPRO=$DEVKITPRO"
-          echo "DEVKITARM=$DEVKITARM"
-
-          for tool in arm-none-eabi-gcc make; do
-            command -v "$tool"
-          done
-
-          test -f "$DEVKITARM/3ds_rules"
+          echo "=== Searching for required libraries ==="
 
           for lib in \
             libctru.a \
@@ -58,12 +64,12 @@ jobs:
             libcitro3d.a \
             libz.a
           do
-            echo "=== $lib ==="
+            echo "--- $lib ---"
             find "$DEVKITPRO" -type f -name "$lib" -print
 
             if ! find "$DEVKITPRO" -type f -name "$lib" \
               -print -quit | grep -q .; then
-              echo "::error::SDK library missing: $lib"
+              echo "::error::Library not found: $lib"
               exit 1
             fi
           done
@@ -74,17 +80,6 @@ jobs:
           set -eu
 
           LIB="third_party/decoder/lib"
-
-          # Handle the alternate filenames previously reported.
-          if [ ! -f "$LIB/libavutil.a" ] &&
-             [ -f "$LIB/lubavutil.a" ]; then
-            ln -s lubavutil.a "$LIB/libavutil.a"
-          fi
-
-          if [ ! -f "$LIB/libnghttp2.a" ] &&
-             [ -f "$LIB/libnghttp2." ]; then
-            ln -s 'libnghttp2.' "$LIB/libnghttp2.a"
-          fi
 
           for lib in \
             libswresample.a \
@@ -102,7 +97,7 @@ jobs:
             libmbedcrypto.a
           do
             if [ ! -s "$LIB/$lib" ]; then
-              echo "::error::Missing decoder archive: $LIB/$lib"
+              echo "::error::Missing decoder library: $LIB/$lib"
               exit 1
             fi
           done
@@ -114,7 +109,6 @@ jobs:
 
           export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
 
-          # Temporarily exclude the bundled libctru archive.
           BUNDLED="third_party/decoder/lib/libctru.a"
           DISABLED="third_party/decoder/lib/libctru.a.disabled"
 
