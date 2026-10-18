@@ -4,9 +4,13 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
+
     container:
       image: devkitpro/devkitarm:latest
 
@@ -18,20 +22,37 @@ jobs:
         shell: bash
         run: |
           set -eux
-          git clone --depth 1 \
-            https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
-            /tmp/3ds-reference
 
-          mkdir -p library/include library/lib source
+          if [ ! -d /tmp/3ds-reference ]; then
+            git clone --depth 1 \
+              https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
+              /tmp/3ds-reference
+          fi
+
+          mkdir -p library/include library/lib source build
+
           cp -a /tmp/3ds-reference/library/include/. library/include/
           cp -a /tmp/3ds-reference/library/lib/. library/lib/
+
           rm -f library/lib/libctru.a
 
-      - name: Verify source files
+      - name: Verify project
+        shell: bash
         run: |
+          set -eux
           test -s source/main.c
           test -s Makefile
           grep -q 'include.*3ds_rules' Makefile
+          grep -q 'TARGET.*Minimalvideoplayer' Makefile
+
+      - name: Clean temporary build files
+        shell: bash
+        run: |
+          set -eux
+          rm -rf build
+          rm -f Minimalvideoplayer.elf
+          rm -f Minimalvideoplayer.3dsx
+          rm -f Minimalvideoplayer.smdh
 
       - name: Build application
         shell: bash
@@ -39,14 +60,17 @@ jobs:
           set -eux
           export DEVKITPRO=/opt/devkitpro
           export DEVKITARM=/opt/devkitpro/devkitARM
-          make clean
           make
 
-      - name: Upload 3DSX
+      - name: Verify output
+        shell: bash
+        run: |
+          set -eux
+          test -s Minimalvideoplayer.3dsx
+
+      - name: Upload application
         uses: actions/upload-artifact@v4
         with:
           name: Minimalvideoplayer-3DS
-          path: |
-            Minimalvideoplayer.3dsx
-            Minimalvideoplayer.smdh
+          path: Minimalvideoplayer.3dsx
           if-no-files-found: error
