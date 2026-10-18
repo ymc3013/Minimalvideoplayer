@@ -1,21 +1,43 @@
+
+.SUFFIXES:
+
+ifeq ($(strip $(DEVKITARM)),)
+$(error DEVKITARM n'est pas défini)
+endif
+
+TOPDIR := $(CURDIR)
+include $(DEVKITARM)/3ds_rules
+
 TARGET := Minimalvideoplayer
 BUILD := build
 SOURCES := source
-INCLUDES := include
+INCLUDES := third_party/decoder/include
+LIBDIRS := third_party/decoder/lib
 
 ARCH := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 
-CFLAGS := -g -O2 -Wall -mword-relocations -ffunction-sections
-CFLAGS += $(ARCH) -D__3DS__
+CFLAGS := -O2 -Wall -ffunction-sections $(ARCH) -D__3DS__
+CFLAGS += -I$(TOPDIR)/third_party/decoder/include
 
-CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions
-ASFLAGS := $(ARCH)
 LDFLAGS := -specs=3dsx.specs $(ARCH) -Wl,--gc-sections
 
-LIBS := -lctru
+LIBS := \
+    -L$(TOPDIR)/third_party/decoder/lib \
+    -lavformat \
+    -lavcodec \
+    -lswresample \
+    -lswscale \
+    $(TOPDIR)/third_party/decoder/lib/lubavutil.a \
+    -lctru -lm
 
-APP_TITLE := Minimalvideoplayer
-APP_DESCRIPTION := Minimal video player
-APP_AUTHOR := ymc3013
+.PHONY: all clean
 
-include $(DEVKITPRO)/devkitARM/3ds_rules
+all:
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(SOURCES)/main.c \
+	    $(LDFLAGS) $(LIBS) \
+	    -o $(BUILD)/$(TARGET).elf
+	3dsxtool $(BUILD)/$(TARGET).elf $(TARGET).3dsx
+
+clean:
+	rm -rf $(BUILD) $(TARGET).3dsx
