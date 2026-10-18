@@ -32,10 +32,7 @@ jobs:
 
           export PATH="/opt/devkitpro/devkitARM/bin:/opt/devkitpro/tools/bin:$PATH"
 
-          if ! command -v dkp-pacman >/dev/null 2>&1; then
-            echo "::error::dkp-pacman is unavailable in the container."
-            exit 1
-          fi
+          command -v dkp-pacman
 
           dkp-pacman -Sy --noconfirm
           dkp-pacman -S --needed --noconfirm \
@@ -45,34 +42,45 @@ jobs:
             citro3d \
             libctru
 
-          echo "=== Installed SDK ==="
+          command -v arm-none-eabi-gcc
+          command -v make
+
           echo "DEVKITPRO=$DEVKITPRO"
           echo "DEVKITARM=$DEVKITARM"
-          arm-none-eabi-gcc --version
-          make --version
 
       - name: Locate SDK libraries
         shell: bash
         run: |
           set -eu
 
-          echo "=== Searching for required libraries ==="
+          find_library() {
+            name="$1"
+            result="$(find "$DEVKITPRO" -type f -name "$name" -print -quit)"
 
-          for lib in \
-            libctru.a \
-            libcitro2d.a \
-            libcitro3d.a \
-            libz.a
-          do
-            echo "--- $lib ---"
-            find "$DEVKITPRO" -type f -name "$lib" -print
-
-            if ! find "$DEVKITPRO" -type f -name "$lib" \
-              -print -quit | grep -q .; then
-              echo "::error::Library not found: $lib"
+            if [ -z "$result" ]; then
+              echo "::error::Cannot find $name under $DEVKITPRO"
               exit 1
             fi
-          done
+
+            dirname "$result"
+          }
+
+          CTRU_DIR="$(find_library libctru.a)"
+          CITRO2D_DIR="$(find_library libcitro2d.a)"
+          CITRO3D_DIR="$(find_library libcitro3d.a)"
+          ZLIB_DIR="$(find_library libz.a)"
+
+          {
+            echo "SDK_CTRU_DIR=$CTRU_DIR"
+            echo "SDK_CITRO2D_DIR=$CITRO2D_DIR"
+            echo "SDK_CITRO3D_DIR=$CITRO3D_DIR"
+            echo "SDK_ZLIB_DIR=$ZLIB_DIR"
+          } >> "$GITHUB_ENV"
+
+          echo "libctru: $CTRU_DIR"
+          echo "libcitro2d: $CITRO2D_DIR"
+          echo "libcitro3d: $CITRO3D_DIR"
+          echo "libz: $ZLIB_DIR"
 
       - name: Verify decoder libraries
         shell: bash
