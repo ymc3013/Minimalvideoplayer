@@ -1,7 +1,12 @@
+
 .SUFFIXES:
 
 ifeq ($(strip $(DEVKITARM)),)
 $(error DEVKITARM is not defined)
+endif
+
+ifeq ($(strip $(DEVKITPRO)),)
+$(error DEVKITPRO is not defined)
 endif
 
 TOPDIR := $(CURDIR)
@@ -26,7 +31,7 @@ CFLAGS += $(foreach dir,$(INCLUDES),-I$(dir))
 
 LDFLAGS := -specs=3dsx.specs $(ARCH) -Wl,--gc-sections
 
-# Bibliothèques du décodeur : utiliser leurs chemins explicites.
+# Bibliothèques principales du décodeur.
 DECODER_LIBS := \
 	$(DECODER_LIBDIR)/libswresample.a \
 	$(DECODER_LIBDIR)/libavformat.a \
@@ -34,7 +39,7 @@ DECODER_LIBS := \
 	$(DECODER_LIBDIR)/libavcodec.a \
 	$(DECODER_LIBDIR)/libavutil.a
 
-# Autres bibliothèques fournies avec le projet.
+# Bibliothèques complémentaires fournies par le projet.
 EXTRA_LIBS := \
 	$(DECODER_LIBDIR)/libx264.a \
 	$(DECODER_LIBDIR)/libmp3lame.a \
@@ -45,33 +50,39 @@ EXTRA_LIBS := \
 	$(DECODER_LIBDIR)/libmbedx509.a \
 	$(DECODER_LIBDIR)/libmbedcrypto.a
 
-# Bibliothèques système du devkitPro.
-# Ne pas utiliser le libctru.a potentiellement incompatible du dossier tiers.
+# Bibliothèques du SDK devkitPro.
+# Ne pas ajouter -L$(DECODER_LIBDIR) : cela pourrait sélectionner
+# une ancienne copie de libctru.a ou libz.a.
 SYSTEM_LIBS := -lcitro2d -lcitro3d -lctru -lm -lc -lz
 
-CFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
+CFILES := $(notdir $(wildcard $(SOURCES)/*.c))
 OFILES := $(addprefix $(BUILD)/,$(CFILES:.c=.o))
 
-.PHONY: all clean
+.PHONY: all clean check-libs
 
 all: $(TARGET).3dsx
 
 $(BUILD):
 	mkdir -p $(BUILD)
 
-$(BUILD)/%.o: $(SOURCES)/%.c | $(BUILD)
-	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
-
-$(TARGET).elf: $(OFILES)
-	@for lib in $(DECODER_LIBS) $(EXTRA_LIBS); do \
+check-libs:
+	@set -e; \
+	for lib in $(DECODER_LIBS) $(EXTRA_LIBS); do \
 		if [ ! -f "$$lib" ]; then \
 			echo "ERREUR : bibliothèque manquante : $$lib"; \
 			exit 1; \
 		fi; \
 	done
+
+$(BUILD)/%.o: $(SOURCES)/%.c | $(BUILD)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(TARGET).elf: $(OFILES) | check-libs
 	$(CC) $(LDFLAGS) -o $@ $(OFILES) \
 		-Wl,--start-group \
-		$(DECODER_LIBS) $(EXTRA_LIBS) $(SYSTEM_LIBS) \
+		$(DECODER_LIBS) \
+		$(EXTRA_LIBS) \
+		$(SYSTEM_LIBS) \
 		-Wl,--end-group
 
 $(TARGET).3dsx: $(TARGET).elf
