@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    name: Build autonomous 3DS application
+    name: Build MinimalVideoPlayer
     runs-on: ubuntu-latest
     container:
       image: devkitpro/devkitarm:latest
@@ -19,41 +19,85 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Check toolchain
+      - name: Check devkitPro tools
         shell: bash
         run: |
           set -eu
           test -x "$DEVKITARM/bin/arm-none-eabi-gcc"
+          test -f "$DEVKITARM/3ds_rules"
           command -v make
           command -v git
+          command -v python3
+          command -v smdhtool
 
-      - name: Get decoder libraries only
+      - name: Fetch decoder libraries
         shell: bash
         run: |
           set -eu
+
+          # Fetch the libraries only; never build or launch the old player.
           git clone --depth 1 \
             https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
-            /tmp/decoder-deps
+            /tmp/decoder-dependencies
 
-          test -d /tmp/decoder-deps/library/include
-          test -d /tmp/decoder-deps/library/lib
+          test -d /tmp/decoder-dependencies/library/include
+          test -d /tmp/decoder-dependencies/library/lib
 
           mkdir -p source library
-          cp -a /tmp/decoder-deps/library/include library/
-          cp -a /tmp/decoder-deps/library/lib library/
+          cp -a /tmp/decoder-dependencies/library/include/. \
+            library/include/
+          cp -a /tmp/decoder-dependencies/library/lib/. \
+            library/lib/
 
-          # Copy the toolchain Makefile as a build template.
-          cp /tmp/decoder-deps/Makefile ./Makefile
+          for lib in avformat avcodec avutil swscale swresample; do
+            if ! find library/lib -maxdepth 1 \
+              -name "lib${lib}.a" -print -quit | grep -q .; then
+              echo "Missing static decoder library: lib${lib}.a"
+              exit 1
+            fi
+          done
 
-      - name: Generate autonomous source
+      - name: Generate application icon
+        shell: bash
+        run: |
+          set -eu
+
+          python3 - <<'PY'
+          import struct
+          import zlib
+          from pathlib import Path
+
+          def chunk(name, data):
+              block = name + data
+              return (
+                  struct.pack(">I", len(data))
+                  + block
+                  + struct.pack(">I", zlib.crc32(block) & 0xffffffff)
+              )
+
+          width = height = 48
+          row = b"\x00" + bytes([28, 28, 42, 255]) * width
+          image = b"".join(row for _ in range(height))
+
+          png = (
+              b"\x89PNG\r\n\x1a\n"
+              + chunk(b"IHDR", struct.pack(
+                  ">IIBBBBB", width, height, 8, 6, 0, 0, 0
+              ))
+              + chunk(b"IDAT", zlib.compress(image))
+              + chunk(b"IEND", b"")
+          )
+
+          Path("icon.png").write_bytes(png)
+          PY
+
+      - name: Generate autonomous player source
         shell: bash
         run: |
           set -eu
 
           cat > source/main.c <<'EOF'
           #include <stdio.h>
-          #include <string.h>
-
           #include <3ds.h>
           #include <libavformat/avformat.h>
           #include <libavcodec/avcodec.h>
@@ -65,38 +109,41 @@ jobs:
               gfxInitDefault();
               consoleInit(GFX_TOP, NULL);
 
-              printf("MinimalVideoPlayer\n");
-              printf("Autonomous decoder test\n\n");
-              printf("File: %s\n\n", VIDEO_PATH);
-
               AVFormatContext *format = NULL;
-              int result = avformat_open_input(
+              int result;
+              int video_index = -1;
+              int audio_index = -1;
+
+              printf("MinimalVideoPlayer\n");
+              printf("Opening test.avi...\n\n");
+
+              result = avformat_open_input(
                   &format, VIDEO_PATH, NULL, NULL
               );
 
               if (result < 0) {
-                  printf("ERROR: cannot open AVI.\n");
+                  printf("Could not open AVI.\n");
                   printf("Check sdmc:/Movies/test.avi\n");
-                  goto wait_exit;
+                  goto exit_loop;
               }
 
               result = avformat_find_stream_info(format, NULL);
+
               if (result < 0) {
-                  printf("ERROR: cannot read AVI streams.\n");
+                  printf("Could not read AVI streams.\n");
                   avformat_close_input(&format);
-                  goto wait_exit;
+                  goto exit_loop;
               }
 
-              int video_index = -1;
-              int audio_index = -1;
+              for (unsigned int i = 0;
+                   i < format->nb_streams; i++) {
+                  enum AVMediaType type =
+                      format->streams[i]->codecpar->codec_type;
 
-              for (unsigned int i = 0; i < format->nb_streams; i++) {
-                  AVCodecParameters *p = format->streams[i]->codecpar;
-
-                  if (p->codec_type == AVMEDIA_TYPE_VIDEO)
+                  if (type == AVMEDIA_TYPE_VIDEO)
                       video_index = (int)i;
 
-                  if (p->codec_type == AVMEDIA_TYPE_AUDIO)
+                  if (type == AVMEDIA_TYPE_AUDIO)
                       audio_index = (int)i;
               }
 
@@ -108,9 +155,9 @@ jobs:
                   const AVCodec *decoder =
                       avcodec_find_decoder(p->codec_id);
 
-                  printf("Video: %dx%d\n", p->width, p->height);
-                  printf("Video codec: %s\n",
-                      decoder ? decoder->name : "unsupported");
+                  printf("Video: %d x %d\n", p->width, p->height);
+                  printf("Video decoder: %s\n",
+                      decoder ? decoder->name : "not available");
               } else {
                   printf("No video stream found.\n");
               }
@@ -121,18 +168,19 @@ jobs:
                   const AVCodec *decoder =
                       avcodec_find_decoder(p->codec_id);
 
-                  printf("Audio codec: %s\n",
-                      decoder ? decoder->name : "unsupported");
+                  printf("Audio decoder: %s\n",
+                      decoder ? decoder->name : "not available");
               } else {
                   printf("No audio stream found.\n");
               }
 
-              printf("\nDecoder library check complete.\n");
-              printf("This build does not render video or play audio yet.\n");
-
               avformat_close_input(&format);
 
-          wait_exit:
+              printf("\nDecoder test only.\n");
+              printf("Video rendering and audio output\n");
+              printf("are not implemented yet.\n");
+
+          exit_loop:
               printf("\nPress START to exit.");
 
               while (aptMainLoop()) {
@@ -151,62 +199,88 @@ jobs:
           }
           EOF
 
-      - name: Configure our own application
+      - name: Generate standalone Makefile
         shell: bash
         run: |
           set -eu
 
+          cat > Makefile <<'EOF'
+          .SUFFIXES:
+
+          ifeq ($(strip $(DEVKITARM)),)
+          $(error DEVKITARM is not configured)
+          endif
+
+          include $(DEVKITARM)/3ds_rules
+
+          TARGET := Minimalvideoplayer
+          BUILD := build
+          SOURCES := source
+          DATA :=
+          INCLUDES := library/include
+          GRAPHICS :=
+          ROMFS :=
+          ICON := icon.png
+
+          APP_TITLE := MinimalVideoPlayer
+          APP_DESCRIPTION := Autonomous AVI decoder test
+          APP_AUTHOR := ymc3013
+
+          ARCH := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
+
+          CFLAGS := -O2 -Wall -mword-relocations \
+                    -fomit-frame-pointer $(ARCH)
+          CFLAGS += $(INCLUDE) -DARM11 -D_3DS
+
+          LDFLAGS := -specs=3dsx.specs $(ARCH) \
+                     -Wl,-Map,$(notdir $*.map)
+
+          LIBDIRS := library/lib $(PORTLIBS) $(CTRULIB)
+
+          LIBS := -lavformat -lavcodec -lswscale -lswresample \
+                  -lavutil -lx264 -lmp3lame -ldav1d -lcurl \
+                  -lnghttp2 -lmbedtls -lmbedx509 -lmbedcrypto \
+                  -lctru -lz -lm
+
+          .PHONY: all clean
+
+          all: 3dsx
+
+          3dsx:
+          	$(MAKE) --no-print-directory -C $(BUILD) \
+          	  -f $(CURDIR)/Makefile
+
+          clean:
+          	rm -rf $(BUILD) $(TARGET).3dsx \
+          	  $(TARGET).smdh $(TARGET).elf
+          EOF
+
+          # Ensure the generated Makefile uses real tab characters.
           python3 - <<'PY'
           from pathlib import Path
-
           p = Path("Makefile")
           s = p.read_text()
-
           s = s.replace(
-              "TARGET\t\t:=\t$(notdir $(CURDIR))",
-              "TARGET\t\t:=\tMinimalvideoplayer"
+              "\t$(MAKE) --no-print-directory -C $(BUILD) \\\n",
+              "\t$(MAKE) --no-print-directory -C $(BUILD) \\\n"
           )
-          s = s.replace(
-              "SOURCES\t\t:=\tsource source/system source/system/util source/system/draw",
-              "SOURCES\t\t:=\tsource"
-          )
-          s = s.replace(
-              "INCLUDES\t:=\tinclude library/include",
-              "INCLUDES\t:=\tlibrary/include"
-          )
-          s = s.replace(
-              "DATA\t\t:=\tdata",
-              "DATA\t\t:=\tdata"
-          )
-          s = s.replace(
-              "APP_TITLE\t\t\t:= Video player for 3DS",
-              "APP_TITLE\t\t\t:= MinimalVideoPlayer"
-          )
-          s = s.replace(
-              "APP_DESCRIPTION\t\t:= Video player for 3DS v1.8.0",
-              "APP_DESCRIPTION\t\t:= Autonomous AVI decoder test"
-          )
-          s = s.replace(
-              "APP_AUTHOR\t\t\t:= Core_2_Extreme",
-              "APP_AUTHOR\t\t\t:= ymc3013"
-          )
-
           p.write_text(s)
           PY
 
-      - name: Compile
+      - name: Compile application
         shell: bash
         run: |
           set -eu
-          make clean || true
+          make clean
           make 3dsx
-
           test -s Minimalvideoplayer.3dsx
+
           mkdir -p output
           cp Minimalvideoplayer.3dsx output/
-          ls -lh output/
+          test -s output/Minimalvideoplayer.3dsx
+          ls -lh output/Minimalvideoplayer.3dsx
 
-      - name: Upload application
+      - name: Upload 3DSX
         uses: actions/upload-artifact@v4
         with:
           name: Minimalvideoplayer-3DSX
