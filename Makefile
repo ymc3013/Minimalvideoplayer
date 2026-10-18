@@ -30,10 +30,10 @@ CFLAGS += -D__3DS__ -U__STRICT_ANSI__ -std=gnu11
 CFLAGS += $(foreach dir,$(INCLUDES),-I$(dir))
 
 SYSTEM_LIBDIRS := \
-	$(DEVKITPRO)/libctru/lib \
-	$(DEVKITPRO)/citro2d/lib \
-	$(DEVKITPRO)/citro3d/lib \
-	$(DEVKITPRO)/portlibs/3ds/lib
+	$(SDK_CTRU_DIR) \
+	$(SDK_CITRO2D_DIR) \
+	$(SDK_CITRO3D_DIR) \
+	$(SDK_ZLIB_DIR)
 
 LDFLAGS += -specs=3dsx.specs $(ARCH) -Wl,--gc-sections
 LDFLAGS += $(foreach dir,$(SYSTEM_LIBDIRS),-L$(dir))
@@ -76,10 +76,10 @@ check-libs:
 		fi; \
 	done; \
 	for lib in \
-		"$(DEVKITPRO)/libctru/lib/libctru.a" \
-		"$(DEVKITPRO)/citro2d/lib/libcitro2d.a" \
-		"$(DEVKITPRO)/citro3d/lib/libcitro3d.a" \
-		"$(DEVKITPRO)/portlibs/3ds/lib/libz.a"; do \
+		"$(SDK_CTRU_DIR)/libctru.a" \
+		"$(SDK_CITRO2D_DIR)/libcitro2d.a" \
+		"$(SDK_CITRO3D_DIR)/libcitro3d.a" \
+		"$(SDK_ZLIB_DIR)/libz.a"; do \
 		if [ ! -s "$$lib" ]; then \
 			echo "ERROR: SDK library not found: $$lib"; \
 			exit 1; \
