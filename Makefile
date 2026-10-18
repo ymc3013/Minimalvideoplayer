@@ -16,11 +16,8 @@ TARGET := Minimalvideoplayer
 BUILD := build
 SOURCES := source
 
-DECODER_DIR := third_party/decoder
-DECODER_LIBDIR := $(DECODER_DIR)/lib
-
-INCLUDES := $(DECODER_DIR)/include
-CFLAGS += $(foreach dir,$(INCLUDES),-I$(dir))
+INCLUDES := third_party/decoder/include
+DECODER_LIBDIR := third_party/decoder/lib
 
 APP_TITLE := Minimal Video Player
 APP_DESCRIPTION := Automatic AVI video player
@@ -28,18 +25,18 @@ APP_AUTHOR := ymc3013
 
 ARCH := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 
-CFLAGS += -O2 -Wall -mword-relocations -ffunction-sections
-CFLAGS += $(ARCH) -D__3DS__ -U__STRICT_ANSI__ -std=gnu11
+CFLAGS := -O2 -Wall -mword-relocations -ffunction-sections $(ARCH)
+CFLAGS += -D__3DS__ -U__STRICT_ANSI__ -std=gnu11
+CFLAGS += $(foreach dir,$(INCLUDES),-I$(dir))
+
+SYSTEM_LIBDIRS := \
+	$(DEVKITPRO)/libctru/lib \
+	$(DEVKITPRO)/citro2d/lib \
+	$(DEVKITPRO)/citro3d/lib \
+	$(DEVKITPRO)/portlibs/3ds/lib
 
 LDFLAGS += -specs=3dsx.specs $(ARCH) -Wl,--gc-sections
-
-# Official SDK library directories.
-# The workflow verifies that these libraries actually exist.
-LIBDIRS := \
-	$(DEVKITPRO)/libctru \
-	$(DEVKITPRO)/citro2d \
-	$(DEVKITPRO)/citro3d \
-	$(DEVKITPRO)/portlibs/3ds
+LDFLAGS += $(foreach dir,$(SYSTEM_LIBDIRS),-L$(dir))
 
 DECODER_LIBS := \
 	$(DECODER_LIBDIR)/libswresample.a \
@@ -58,7 +55,7 @@ EXTRA_LIBS := \
 	$(DECODER_LIBDIR)/libmbedx509.a \
 	$(DECODER_LIBDIR)/libmbedcrypto.a
 
-SYSTEM_LIBS := -lcitro2d -lcitro3d -lctru -lz -lm -lc
+SYSTEM_LIBS := -lcitro2d -lcitro3d -lctru -lm -lc -lz
 
 CFILES := $(notdir $(wildcard $(SOURCES)/*.c))
 OFILES := $(addprefix $(BUILD)/,$(CFILES:.c=.o))
@@ -68,28 +65,23 @@ OFILES := $(addprefix $(BUILD)/,$(CFILES:.c=.o))
 all: $(TARGET).3dsx
 
 $(BUILD):
-	mkdir -p $@
+	mkdir -p $(BUILD)
 
 check-libs:
-	@set -eu; \
+	@set -e; \
 	for lib in $(DECODER_LIBS) $(EXTRA_LIBS); do \
 		if [ ! -s "$$lib" ]; then \
-			echo "ERROR: Missing or empty archive: $$lib"; \
+			echo "ERROR: missing or empty library $$lib"; \
 			exit 1; \
 		fi; \
-	done
-	@set -eu; \
-	for lib in libctru.a libcitro2d.a libcitro3d.a libz.a; do \
-		found=0; \
-		for dir in $(LIBDIRS); do \
-			if [ -s "$$dir/lib/$$lib" ]; then \
-				found=1; \
-				break; \
-			fi; \
-		done; \
-		if [ "$$found" -eq 0 ]; then \
-			echo "ERROR: SDK archive not found: $$lib"; \
-			echo "Check the installed devkitPro packages and LIBDIRS."; \
+	done; \
+	for lib in \
+		"$(DEVKITPRO)/libctru/lib/libctru.a" \
+		"$(DEVKITPRO)/citro2d/lib/libcitro2d.a" \
+		"$(DEVKITPRO)/citro3d/lib/libcitro3d.a" \
+		"$(DEVKITPRO)/portlibs/3ds/lib/libz.a"; do \
+		if [ ! -s "$$lib" ]; then \
+			echo "ERROR: SDK library not found: $$lib"; \
 			exit 1; \
 		fi; \
 	done
