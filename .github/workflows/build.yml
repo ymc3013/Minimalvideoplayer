@@ -1,3 +1,4 @@
+
 name: Build Minimalvideoplayer
 
 on:
@@ -16,6 +17,7 @@ jobs:
   build:
     name: Build 3DSX
     runs-on: ubuntu-latest
+
     container:
       image: devkitpro/devkitarm:latest
 
@@ -27,8 +29,6 @@ jobs:
         shell: bash
         run: |
           set -eu
-          echo "DEVKITPRO=${DEVKITPRO:-unset}"
-          echo "DEVKITARM=${DEVKITARM:-unset}"
 
           test -n "${DEVKITPRO:-}" || {
             echo "::error::DEVKITPRO is not configured."
@@ -41,19 +41,14 @@ jobs:
           }
 
           export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
+
           echo "$DEVKITARM/bin" >> "$GITHUB_PATH"
           echo "$DEVKITPRO/tools/bin" >> "$GITHUB_PATH"
 
-          if command -v arm-none-eabi-gcc >/dev/null 2>&1; then
-            arm-none-eabi-gcc --version
-          elif [ -x "$DEVKITARM/bin/arm-none-eabi-gcc" ]; then
-            "$DEVKITARM/bin/arm-none-eabi-gcc" --version
-          else
-            echo "::error::ARM compiler not found."
-            find "$DEVKITPRO" -name arm-none-eabi-gcc -print || true
-            exit 1
-          fi
+          echo "DEVKITPRO=$DEVKITPRO"
+          echo "DEVKITARM=$DEVKITARM"
 
+          arm-none-eabi-gcc --version
           make --version
 
       - name: Verify project files
@@ -62,12 +57,12 @@ jobs:
           set -eu
 
           test -f Makefile || {
-            echo "::error::Makefile missing."
+            echo "::error::Makefile is missing."
             exit 1
           }
 
           test -f source/main.c || {
-            echo "::error::source/main.c missing."
+            echo "::error::source/main.c is missing."
             exit 1
           }
 
@@ -89,26 +84,67 @@ jobs:
             if [ -f third_party/decoder/lib/lubavutil.a ]; then
               ln -s lubavutil.a third_party/decoder/lib/libavutil.a
             else
-              echo "::error::Missing libavutil.a and lubavutil.a"
+              echo "::error::Neither libavutil.a nor lubavutil.a exists."
               exit 1
             fi
           fi
 
           echo "Project files verified."
 
+      - name: Diagnose libctru libraries
+        shell: bash
+        run: |
+          set -eu
+
+          echo "Libraries named libctru.a in devkitPro:"
+          find "$DEVKITPRO" -name libctru.a -type f -print || true
+
+          echo "Bundled libctru:"
+          if [ -f third_party/decoder/lib/libctru.a ]; then
+            ls -lh third_party/decoder/lib/libctru.a
+          else
+            echo "No bundled libctru.a found."
+          fi
+
       - name: Build Minimalvideoplayer
         shell: bash
         run: |
           set -eu
+
           export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
+
+          # Prevent the bundled libctru.a from shadowing the SDK copy.
+          BUNDLED_CTRU="third_party/decoder/lib/libctru.a"
+          DISABLED_CTRU="third_party/decoder/lib/libctru.a.disabled"
+
+          if [ -e "$DISABLED_CTRU" ]; then
+            echo "::error::libctru.a.disabled already exists; inspect the repository."
+            exit 1
+          fi
+
+          restore_ctru() {
+            if [ -e "$DISABLED_CTRU" ]; then
+              mv "$DISABLED_CTRU" "$BUNDLED_CTRU"
+            fi
+          }
+
+          trap restore_ctru EXIT
+
+          if [ -f "$BUNDLED_CTRU" ]; then
+            mv "$BUNDLED_CTRU" "$DISABLED_CTRU"
+            echo "Temporarily disabled bundled libctru.a."
+          fi
 
           make clean
           make -j2
 
           test -s Minimalvideoplayer.3dsx
+
+          echo "Build successful:"
           ls -lh Minimalvideoplayer.3dsx
 
       - name: Upload 3DSX artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: Minimalvideoplayer-3dsx
