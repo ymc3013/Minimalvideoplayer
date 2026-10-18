@@ -1,25 +1,22 @@
-.DEFAULT_GOAL := all
+TARGET := Minimalvideoplayer
+BUILD := build
+SOURCES := source
+INCLUDES := include library/include
+LIBDIRS := library/lib
 
-TARGET      := Minimalvideoplayer
-BUILD       := build
-SOURCES     := source
-INCLUDES    := include library/include
-LIBDIRS     := library/lib
+ARCH := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 
-ARCH        := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
+CFLAGS := -g -O2 -Wall -ffunction-sections -fdata-sections $(ARCH)
+CFLAGS += -D__3DS__
+CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions
+ASFLAGS := $(ARCH)
+LDFLAGS := -specs=3dsx.specs $(ARCH) -Wl,--gc-sections
 
-CFLAGS      := -g -O2 -Wall -ffunction-sections -fdata-sections $(ARCH)
-CFLAGS      += -D__3DS__
-CXXFLAGS    := $(CFLAGS) -fno-rtti -fno-exceptions
-ASFLAGS     := $(ARCH)
-LDFLAGS     := -specs=3dsx.specs $(ARCH) -Wl,--gc-sections
+LIBS := -lswresample -lavformat -lswscale -lavcodec -lavutil
+LIBS += -lx264 -lmp3lame -ldav1d -lz -lm -lctru
 
-LIBS        := -lswresample -lavformat -lswscale -lavcodec -lavutil
-LIBS        += -lx264 -lmp3lame -ldav1d -lz -lm -lctru
-
-APP_TITLE       := Minimal Video Player
+APP_TITLE := Minimal Video Player
 APP_DESCRIPTION := Automatic AVI Player
-APP_AUTHOR      := ymc3013
-APP_ICON        := $(DEVKITPRO)/libctru/default_icon.png
+APP_AUTHOR := ymc3013
 
-include $(DEVKITPRO)/devkitARM/3ds_rules
+include $(DEVKITARM)/3ds_rules
