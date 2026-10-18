@@ -1,3 +1,4 @@
+
 .SUFFIXES:
 
 ifeq ($(strip $(DEVKITARM)),)
@@ -15,8 +16,11 @@ TARGET := Minimalvideoplayer
 BUILD := build
 SOURCES := source
 
-INCLUDES := third_party/decoder/include
-DECODER_LIBDIR := third_party/decoder/lib
+DECODER_DIR := third_party/decoder
+DECODER_LIBDIR := $(DECODER_DIR)/lib
+
+INCLUDES := $(DECODER_DIR)/include
+CFLAGS += $(foreach dir,$(INCLUDES),-I$(dir))
 
 APP_TITLE := Minimal Video Player
 APP_DESCRIPTION := Automatic AVI video player
@@ -24,20 +28,19 @@ APP_AUTHOR := ymc3013
 
 ARCH := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 
-CFLAGS := -O2 -Wall -mword-relocations -ffunction-sections $(ARCH)
-CFLAGS += -D__3DS__ -U__STRICT_ANSI__ -std=gnu11
-CFLAGS += $(foreach dir,$(INCLUDES),-I$(dir))
+CFLAGS += -O2 -Wall -mword-relocations -ffunction-sections
+CFLAGS += $(ARCH) -D__3DS__ -U__STRICT_ANSI__ -std=gnu11
 
-# Explicit system library directories from devkitPro
-SYSTEM_LIBDIRS := \
-	-L$(DEVKITPRO)/libctru/lib \
-	-L$(DEVKITPRO)/citro2d/lib \
-	-L$(DEVKITPRO)/citro3d/lib \
-	-L$(DEVKITPRO)/libz/lib
+LDFLAGS += -specs=3dsx.specs $(ARCH) -Wl,--gc-sections
 
-LDFLAGS := -specs=3dsx.specs $(ARCH) -Wl,--gc-sections
+# Official SDK library directories.
+# The workflow verifies that these libraries actually exist.
+LIBDIRS := \
+	$(DEVKITPRO)/libctru \
+	$(DEVKITPRO)/citro2d \
+	$(DEVKITPRO)/citro3d \
+	$(DEVKITPRO)/portlibs/3ds
 
-# FFmpeg libraries bundled in the project
 DECODER_LIBS := \
 	$(DECODER_LIBDIR)/libswresample.a \
 	$(DECODER_LIBDIR)/libavformat.a \
@@ -45,7 +48,6 @@ DECODER_LIBS := \
 	$(DECODER_LIBDIR)/libavcodec.a \
 	$(DECODER_LIBDIR)/libavutil.a
 
-# Extra codec / network libs bundled in the project
 EXTRA_LIBS := \
 	$(DECODER_LIBDIR)/libx264.a \
 	$(DECODER_LIBDIR)/libmp3lame.a \
@@ -56,8 +58,7 @@ EXTRA_LIBS := \
 	$(DECODER_LIBDIR)/libmbedx509.a \
 	$(DECODER_LIBDIR)/libmbedcrypto.a
 
-# System libs from the devkitPro SDK
-SYSTEM_LIBS := -lcitro2d -lcitro3d -lctru -lm -lc -lz
+SYSTEM_LIBS := -lcitro2d -lcitro3d -lctru -lz -lm -lc
 
 CFILES := $(notdir $(wildcard $(SOURCES)/*.c))
 OFILES := $(addprefix $(BUILD)/,$(CFILES:.c=.o))
@@ -67,19 +68,28 @@ OFILES := $(addprefix $(BUILD)/,$(CFILES:.c=.o))
 all: $(TARGET).3dsx
 
 $(BUILD):
-	mkdir -p $(BUILD)
+	mkdir -p $@
 
 check-libs:
-	@set -e; \
+	@set -eu; \
 	for lib in $(DECODER_LIBS) $(EXTRA_LIBS); do \
-		if [ ! -f "$$lib" ]; then \
-			echo "ERROR: missing library $$lib"; \
+		if [ ! -s "$$lib" ]; then \
+			echo "ERROR: Missing or empty archive: $$lib"; \
 			exit 1; \
 		fi; \
-	done; \
-	for dir in "$(DEVKITPRO)/libctru/lib" "$(DEVKITPRO)/citro2d/lib" "$(DEVKITPRO)/citro3d/lib" "$(DEVKITPRO)/libz/lib"; do \
-		if [ ! -d "$$dir" ]; then \
-			echo "ERROR: missing directory $$dir"; \
+	done
+	@set -eu; \
+	for lib in libctru.a libcitro2d.a libcitro3d.a libz.a; do \
+		found=0; \
+		for dir in $(LIBDIRS); do \
+			if [ -s "$$dir/lib/$$lib" ]; then \
+				found=1; \
+				break; \
+			fi; \
+		done; \
+		if [ "$$found" -eq 0 ]; then \
+			echo "ERROR: SDK archive not found: $$lib"; \
+			echo "Check the installed devkitPro packages and LIBDIRS."; \
 			exit 1; \
 		fi; \
 	done
@@ -90,7 +100,6 @@ $(BUILD)/%.o: $(SOURCES)/%.c | $(BUILD)
 $(TARGET).elf: $(OFILES) | check-libs
 	$(CC) $(LDFLAGS) -o $@ $(OFILES) \
 		-Wl,--start-group \
-		$(SYSTEM_LIBDIRS) \
 		$(DECODER_LIBS) \
 		$(EXTRA_LIBS) \
 		$(SYSTEM_LIBS) \
