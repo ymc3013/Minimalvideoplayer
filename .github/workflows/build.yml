@@ -11,25 +11,36 @@ jobs:
       image: devkitpro/devkitarm:latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Check project files
+      - name: Prepare FFmpeg libraries
+        shell: bash
         run: |
-          test -s source/main.c
-          test -s Makefile
+          set -eux
+          git clone --depth 1 \
+            https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
+            /tmp/3ds-reference
 
-      - name: Build application
+          mkdir -p library/include library/lib source
+
+          cp -a /tmp/3ds-reference/library/include/. library/include/
+          cp -a /tmp/3ds-reference/library/lib/. library/lib/
+
+          rm -f library/lib/libctru.a
+
+      - name: Build 3DSX
+        shell: bash
         run: |
+          set -eux
           export DEVKITPRO=/opt/devkitpro
           export DEVKITARM=/opt/devkitpro/devkitARM
-          make
+          make clean || true
+          make 3dsx
 
-      - name: Upload application
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: Minimalvideoplayer-3DS
-          path: |
-            *.3dsx
-            *.smdh
+          name: Minimalvideoplayer
+          path: "*.3dsx"
           if-no-files-found: error
