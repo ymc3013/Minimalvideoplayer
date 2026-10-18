@@ -1,53 +1,115 @@
 
-name: Import video decoding libraries
+name: Import libraries and build player
 
 on:
   workflow_dispatch:
   push:
     paths:
       - ".github/workflows/build.yml"
+      - "Makefile"
+      - "source/**"
+      - "third_party/decoder/**"
 
 permissions:
   contents: write
 
 jobs:
-  import-libraries:
+  build:
     runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkitarm:latest
 
     steps:
-      - name: Checkout Minimalvideoplayer
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           persist-credentials: true
 
-      - name: Download upstream library files only
+      - name: Import upstream libraries if missing
+        shell: bash
         run: |
-          git clone --depth 1 \
-            https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
-            /tmp/video-reference
+          set -euo pipefail
 
-          mkdir -p third_party/decoder
+          if [ ! -d third_party/decoder/include ] ||
+             [ ! -d third_party/decoder/lib ]; then
+            git clone --depth 1 \
+              https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
+              /tmp/video-reference
 
-          test -d /tmp/video-reference/library/include
-          test -d /tmp/video-reference/library/lib
+            mkdir -p third_party/decoder
 
-          rm -rf third_party/decoder/include
-          rm -rf third_party/decoder/lib
+            cp -a /tmp/video-reference/library/include \
+              third_party/decoder/include
 
-          cp -a /tmp/video-reference/library/include \
-            third_party/decoder/include
+            cp -a /tmp/video-reference/library/lib \
+              third_party/decoder/lib
 
-          cp -a /tmp/video-reference/library/lib \
-            third_party/decoder/lib
+            cp /tmp/video-reference/LICENSE \
+              third_party/decoder/UPSTREAM_LICENSE.txt
+          fi
 
-          cp /tmp/video-reference/LICENSE \
-            third_party/decoder/UPSTREAM_LICENSE.txt
-
-          echo "Imported library files:"
-          find third_party/decoder -type f
-
-      - name: Commit library files to repository
+      - name: Prepare library linker aliases
+        shell: bash
         run: |
+          set -euo pipefail
+          LIB="third_party/decoder/lib"
+
+          # Keep the original files; create aliases only if needed.
+          if [ ! -e "$LIB/libavutil.a" ] &&
+             [ -f "$LIB/lubavutil.a" ]; then
+            ln -s lubavutil.a "$LIB/libavutil.a"
+          fi
+
+          if [ ! -e "$LIB/libnghttp2.a" ] &&
+             [ -f "$LIB/libnghttp2." ]; then
+            ln -s 'libnghttp2.' "$LIB/libnghttp2.a"
+          fi
+
+          echo "Available libraries:"
+          find "$LIB" -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Verify toolchain and source files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f source/main.c
+          test -f source/video.c
+          test -f source/video.h
+          test -f source/audio.c
+          test -f source/audio.h
+          test -f source/avi.c
+          test -f source/avi.h
+          test -f Makefile
+
+          echo "DEVKITPRO=${DEVKITPRO:-not set}"
+          echo "DEVKITARM=${DEVKITARM:-not set}"
+          test -n "${DEVKITARM:-}"
+          make --version
+          arm-none-eabi-gcc --version
+
+      - name: Build 3DSX
+        shell: bash
+        run: |
+          set -euo pipefail
+          make clean
+          make -j2 3dsx
+
+          test -s Minimalvideoplayer.3dsx
+
+      - name: Upload 3DSX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Minimalvideoplayer-3DSX
+          path: Minimalvideoplayer.3dsx
+          if-no-files-found: error
+
+      - name: Commit imported libraries
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
