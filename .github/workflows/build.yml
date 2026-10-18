@@ -25,7 +25,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install devkitPro SDK and libraries
+      - name: Install devkitPro SDK and 3DS libraries
         shell: bash
         run: |
           set -eu
@@ -40,7 +40,8 @@ jobs:
             3ds-dev \
             citro2d \
             citro3d \
-            libctru
+            libctru \
+            3ds-zlib
 
           command -v arm-none-eabi-gcc
           command -v make
@@ -55,10 +56,13 @@ jobs:
 
           find_library() {
             name="$1"
-            result="$(find "$DEVKITPRO" -type f -name "$name" -print -quit)"
+            result="$(find "$DEVKITPRO" \
+              -type f \
+              -path '*/portlibs/nds/*' -prune \
+              -o -type f -name "$name" -print -quit)"
 
             if [ -z "$result" ]; then
-              echo "::error::Cannot find $name under $DEVKITPRO"
+              echo "::error::Cannot find $name for the 3DS SDK"
               exit 1
             fi
 
@@ -68,7 +72,13 @@ jobs:
           CTRU_DIR="$(find_library libctru.a)"
           CITRO2D_DIR="$(find_library libcitro2d.a)"
           CITRO3D_DIR="$(find_library libcitro3d.a)"
-          ZLIB_DIR="$(find_library libz.a)"
+          ZLIB_DIR="$DEVKITPRO/portlibs/3ds/lib"
+
+          if [ ! -s "$ZLIB_DIR/libz.a" ]; then
+            echo "::error::3DS zlib not found at $ZLIB_DIR/libz.a"
+            find "$DEVKITPRO/portlibs" -type f -name libz.a -print
+            exit 1
+          fi
 
           {
             echo "SDK_CTRU_DIR=$CTRU_DIR"
@@ -80,7 +90,7 @@ jobs:
           echo "libctru: $CTRU_DIR"
           echo "libcitro2d: $CITRO2D_DIR"
           echo "libcitro3d: $CITRO3D_DIR"
-          echo "libz: $ZLIB_DIR"
+          echo "3DS zlib: $ZLIB_DIR"
 
       - name: Verify decoder libraries
         shell: bash
