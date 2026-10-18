@@ -7,34 +7,22 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkitarm:latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install devkitPro
-        shell: bash
-        run: |
-          set -eux
-          sudo apt-get update
-          sudo apt-get install -y curl ca-certificates
-          curl -fsSL https://apt.devkitpro.org/install-devkitpro-pacman \
-            -o /tmp/install-devkitpro-pacman
-          sudo bash /tmp/install-devkitpro-pacman
-          sudo dkp-pacman -Sy --noconfirm
-          sudo dkp-pacman -S --noconfirm 3ds-dev
-
-      - name: Check files
+      - name: Check project files
         run: |
           test -s source/main.c
           test -s Makefile
 
-      - name: Compile
-        shell: bash
+      - name: Build application
         run: |
-          set -eux
           export DEVKITPRO=/opt/devkitpro
-          export DEVKITARM="$DEVKITPRO/devkitARM"
+          export DEVKITARM=/opt/devkitpro/devkitARM
           make
 
       - name: Upload application
