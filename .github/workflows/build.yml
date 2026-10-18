@@ -1,185 +1,47 @@
-
-name: Build Minimalvideoplayer
+name: CI
 
 on:
   push:
-    paths:
-      - '.github/workflows/build.yml'
-      - 'Makefile'
-      - 'source/**'
-      - 'third_party/decoder/**'
-  workflow_dispatch:
-
-permissions:
-  contents: read
+  pull_request:
 
 jobs:
   build:
-    name: Build 3DSX
     runs-on: ubuntu-latest
 
-    container:
-      image: devkitpro/devkitarm:latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure devkitPro
-        shell: bash
+      - name: Install devkitPro pacman
+        run: |
+          sudo tee /etc/apt/sources.list.d/devkitpro.list > /dev/null <<'EOF'
+          deb https://apt.devkitpro.org stable main
+          EOF
+          wget -qO- https://apt.devkitpro.org/devkitpro-keyring.gpg | sudo apt-key add -
+          sudo apt-get update
+          sudo apt-get install -y devkitpro-pacman
+
+      - name: Install devkitARM and zlib
+        run: |
+          sudo dkp-pacman -Sy --noconfirm
+          sudo dkp-pacman -S --noconfirm devkitARM arm-none-eabi-zlib
+
+      - name: Set DEVKITPRO and DEVKITARM
+        run: |
+          echo "DEVKITPRO=/opt/devkitpro" >> $GITHUB_ENV
+          echo "DEVKITARM=/opt/devkitpro/devkitARM" >> $GITHUB_ENV
+
+      - name: Build
+        env:
+          DEVKITPRO: ${{ env.DEVKITPRO }}
+          DEVKITARM: ${{ env.DEVKITARM }}
         run: |
           set -eu
-
-          test -n "${DEVKITPRO:-}" || {
-            echo "::error::DEVKITPRO is not configured."
-            exit 1
-          }
-
-          test -n "${DEVKITARM:-}" || {
-            echo "::error::DEVKITARM is not configured."
-            exit 1
-          }
-
-          export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
-          echo "$DEVKITARM/bin" >> "$GITHUB_PATH"
-          echo "$DEVKITPRO/tools/bin" >> "$GITHUB_PATH"
-
-          command -v arm-none-eabi-gcc
-          arm-none-eabi-gcc --version
-          make --version
-
-      - name: Install official 3DS libraries
-        shell: bash
-        run: |
-          set -eu
-
-          if ! command -v dkp-pacman >/dev/null 2>&1; then
-            echo "::error::dkp-pacman is missing from the container."
-            echo "The devkitPro package manager must be available."
-            exit 1
-          fi
-
-          dkp-pacman -Sy --noconfirm
-          dkp-pacman -S --needed --noconfirm \
-            3ds-dev \
-            3ds-zlib
-
-      - name: Verify SDK libraries
-        shell: bash
-        run: |
-          set -eu
-
-          echo "=== SDK library locations ==="
-
-          for lib in \
-            libctru.a \
-            libcitro2d.a \
-            libcitro3d.a \
-            libz.a
-          do
-            echo "--- $lib ---"
-            find "$DEVKITPRO" -type f -name "$lib" -print
-          done
-
-          echo "=== Required libraries ==="
-
-          for lib in libctru.a libcitro2d.a libcitro3d.a; do
-            if ! find "$DEVKITPRO" -type f -name "$lib" \
-              -print -quit | grep -q .; then
-              echo "::error::SDK library not found: $lib"
-              exit 1
-            fi
-          done
-
-      - name: Verify project files
-        shell: bash
-        run: |
-          set -eu
-
-          test -f Makefile
-          test -f source/main.c
-          test -f source/avi.c
-          test -f source/video.c
-          test -f source/audio.c
-
-          LIB="third_party/decoder/lib"
-
-          for lib in \
-            libswresample.a \
-            libavformat.a \
-            libswscale.a \
-            libavcodec.a \
-            libx264.a \
-            libmp3lame.a \
-            libdav1d.a \
-            libcurl.a \
-            libmbedtls.a \
-            libmbedx509.a \
-            libmbedcrypto.a
-          do
-            test -s "$LIB/$lib" || {
-              echo "::error::Missing library: $LIB/$lib"
-              exit 1
-            }
-          done
-
-          if [ ! -f "$LIB/libavutil.a" ]; then
-            if [ -f "$LIB/lubavutil.a" ]; then
-              ln -s lubavutil.a "$LIB/libavutil.a"
-            else
-              echo "::error::libavutil.a is missing."
-              exit 1
-            fi
-          fi
-
-          if [ ! -f "$LIB/libnghttp2.a" ] &&
-             [ -f "$LIB/libnghttp2." ]; then
-            ln -s 'libnghttp2.' "$LIB/libnghttp2.a"
-          fi
-
-          test -s "$LIB/libnghttp2.a" || {
-            echo "::error::libnghttp2.a is missing."
-            exit 1
-          }
-
-          echo "Project dependencies verified."
-
-      - name: Build Minimalvideoplayer
-        shell: bash
-        run: |
-          set -eu
-
           export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
 
-          # Avoid linking against the incompatible bundled libctru.
-          BUNDLED="third_party/decoder/lib/libctru.a"
-          DISABLED="third_party/decoder/lib/libctru.a.disabled"
-
-          if [ -e "$DISABLED" ]; then
-            echo "::error::Unexpected leftover $DISABLED"
-            exit 1
-          fi
-
-          restore_ctru() {
-            if [ -e "$DISABLED" ]; then
-              mv "$DISABLED" "$BUNDLED"
-            fi
-          }
-          trap restore_ctru EXIT
-
-          if [ -f "$BUNDLED" ]; then
-            mv "$BUNDLED" "$DISABLED"
-          fi
-
+          # ajustez les flags make si nécessaire
           make clean
           make -j2 V=1
 
           test -s Minimalvideoplayer.3dsx
           ls -lh Minimalvideoplayer.3dsx
-
-      - name: Upload 3DSX artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Minimalvideoplayer-3dsx
-          path: Minimalvideoplayer.3dsx
-          if-no-files-found: error
