@@ -7,17 +7,19 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     container:
       image: devkitpro/devkitarm:latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Prepare FFmpeg libraries
+      - name: Prepare dependencies
         shell: bash
         run: |
           set -eux
+
           git clone --depth 1 \
             https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
             /tmp/3ds-reference
@@ -29,18 +31,30 @@ jobs:
 
           rm -f library/lib/libctru.a
 
-      - name: Build 3DSX
+      - name: Verify required files
+        shell: bash
+        run: |
+          set -eux
+          test -s source/main.c
+          test -s Makefile
+          test -d library/include
+          test -d library/lib
+
+      - name: Build application
         shell: bash
         run: |
           set -eux
           export DEVKITPRO=/opt/devkitpro
           export DEVKITARM=/opt/devkitpro/devkitARM
-          make clean || true
-          make 3dsx
 
-      - name: Upload
+          make clean
+          make
+
+      - name: Upload 3DSX
         uses: actions/upload-artifact@v4
         with:
-          name: Minimalvideoplayer
-          path: "*.3dsx"
+          name: Minimalvideoplayer-3DS
+          path: |
+            Minimalvideoplayer.3dsx
+            Minimalvideoplayer.smdh
           if-no-files-found: error
