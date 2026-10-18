@@ -98,7 +98,7 @@ $(TARGET).elf: $(OFILES) | check-libs
 		-Wl,--end-group
 
 $(TARGET).3dsx: $(TARGET).elf
-	$(3DSXTOOL) $< $@
+	3dsxtool $< $@
 
 clean:
 	rm -rf $(BUILD) $(TARGET).3dsx $(TARGET).elf $(TARGET).smdh
