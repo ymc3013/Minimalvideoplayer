@@ -11,10 +11,6 @@
  * Per video: reader thread (demux) -> packet queues -> video thread (decode+draw).
  * Bottom video additionally: audio thread (decode + NDSP).
  * The top video is synchronised on the bottom video's audio clock, so both stay together.
- * Both videos prebuffer ~1.5 s before playback starts.
- *
- * While the bottom screen shows video it cannot show text: all messages then go only to
- * sdmc:/3ds/minivideo_log.txt, and text is restored on the bottom screen when playback ends.
  *
  * Controls: A = pause/resume, START = quit.
  */
@@ -146,6 +142,7 @@ static void say(const char *f, ...)
     va_start(v, f);
     vsnprintf(b, sizeof(b), f, v);
     va_end(v);
+    /* On affiche sur l'écran du haut si on n'est pas en mode vidéo (g_quiet) */
     if (!g_quiet) fputs(b, stdout);
     if (g_log) { fputs(b, g_log); fflush(g_log); }
 }
@@ -252,7 +249,6 @@ static bool pq_push(PQ *p, AVPacket *src)
     if (!n) return false;
     av_packet_move_ref(n, src);
     LightLock_Lock(&p->lock);
-    /* FIX: also check max_bytes here, not just in pq_full() */
     if (p->count >= p->cap || p->bytes >= p->max_bytes) {
         LightLock_Unlock(&p->lock);
         av_packet_free(&n);
@@ -322,7 +318,6 @@ static bool audio_push(Player *p, const int16_t *src, int n)
         ndspWaveBuf *wb = &a->wb[a->next];
         while (wb->status == NDSP_WBUF_QUEUED || wb->status == NDSP_WBUF_PLAYING) {
             if (g_quit) return false;
-            /* FIX: don't spin forever while paused - NDSP is paused too, buffers stay PLAYING */
             if (g_paused) { svcSleepThread(10000000LL); continue; }
             svcSleepThread(2000000LL);                 /* 2 ms */
         }
@@ -447,7 +442,7 @@ static bool video_setup_scaler(Player *p, const AVFrame *f)
     /* clear this screen once so letterbox bars are black */
     u16 fw, fh;
     u8 *fb = gfxGetFramebuffer(p->screen, GFX_LEFT, &fw, &fh);
-    memset(fb, 0, (size_t)FB_W * p->scr_w * 3);
+    if (fb) memset(fb, 0, (size_t)FB_W * p->scr_w * 3);
     say("[%s] Video: %s %s %dx%d -> %dx%d\n", p->tag, avcodec_get_name(p->vctx->codec_id),
         av_get_pix_fmt_name((enum AVPixelFormat)f->format), f->width, f->height, p->dw, p->dh);
     return true;
@@ -460,8 +455,15 @@ static void video_render(Player *p, const AVFrame *f)
     sws_scale(p->sws, (const uint8_t * const *)f->data, f->linesize, 0, f->height,
               p->dst_data, p->dst_linesize);
 
+    /* Lock around the framebuffer access to prevent races between top and bot threads */
+    LightLock_Lock(&g_gfx_lock);
     u16 fw, fh;
     u8 *fb = gfxGetFramebuffer(p->screen, GFX_LEFT, &fw, &fh);   /* fw=240 */
+    if (!fb) {
+        LightLock_Unlock(&g_gfx_lock);
+        return;
+    }
+
     int ox = (p->scr_w - p->dw) / 2;
     int oy = (SCR_H - p->dh) / 2;
 
@@ -475,41 +477,23 @@ static void video_render(Player *p, const AVFrame *f)
             d += (size_t)FB_W * 3;
         }
     }
-    GSPGPU_FlushDataCache(fb, (u32)FB_W * p->scr_w * 3);   /* only this screen's buffer */
-    LightLock_Lock(&g_gfx_lock);                            /* two threads draw: serialise swaps */
+    GSPGPU_FlushDataCache(fb, (u32)FB_W * p->scr_w * 3);
     gfxScreenSwapBuffers(p->screen, false);
     LightLock_Unlock(&g_gfx_lock);
 }
 
-/*
- * FIX: master_clock must return a sane value even if the master player has not
- * started yet (no audio ready, no vbase). Otherwise the very first comparison in
- * video_present() produces a huge "late" value and every frame is dropped.
- *
- * Semantics:
- *   - If the master's audio is on and aud_ready:  audio_base + audio_clock()
- *   - Else if the master has a wall clock base:    vbase_pts + wall elapsed
- *   - Else: use OUR OWN wall clock base if we have one
- *   - Else: return 0.0 (caller must treat this as "not started")
- */
 static double master_clock(Player *p)
 {
     Player *a = p->clock_src ? p->clock_src : p;
-
     if (a->audio_on && a->aud_ready)
         return a->audio_base + audio_clock(&a->au);
-
-    /* master has no running clock: try the master's wall clock, then our own */
     if (a->have_vbase && a->wall0)
         return a->vbase_pts + (double)(osGetTime() - a->wall0 - g_paused_ms) / 1000.0;
-
     if (p->have_vbase && p->wall0)
         return p->vbase_pts + (double)(osGetTime() - p->wall0 - g_paused_ms) / 1000.0;
-
-    return 0.0;   /* no reference yet */
+    return 0.0;
 }
 
-/* FIX: helper to know if we have a usable reference clock at all */
 static bool master_ready(Player *p)
 {
     Player *a = p->clock_src ? p->clock_src : p;
@@ -527,9 +511,6 @@ static void video_present(Player *p, const AVFrame *f, double pts)
         p->wall0 = osGetTime();
     }
 
-    /* FIX: only wait on the master clock when the master actually has a clock.
-     * Previously, a not-yet-started audio master made wait_ok==false (immediate draw),
-     * but the subsequent "late" computation produced a huge value and dropped everything. */
     bool wait_ok = master_ready(p);
 
     if (wait_ok) {
@@ -537,15 +518,14 @@ static void video_present(Player *p, const AVFrame *f, double pts)
         while (!g_quit && pts - master_clock(p) > 0.002) {
             if (g_paused) { svcSleepThread(10000000LL); continue; }
             svcSleepThread(1000000LL);
-            if (++waited > 500) break;          /* never stall forever on a stuck clock */
+            if (++waited > 500) break;
         }
         while (g_paused && !g_quit) svcSleepThread(10000000LL);
         if (g_quit) return;
         double late = master_clock(p) - pts;
-        /* far behind: ask the decoder to skip non-reference frames until caught up */
         if (late > 0.30 && !p->skipping)       { p->vctx->skip_frame = AVDISCARD_NONREF; p->skipping = true; }
         else if (late < 0.05 && p->skipping)   { p->vctx->skip_frame = AVDISCARD_DEFAULT; p->skipping = false; }
-        if (late > LATE_DROP) { p->dropped++; return; }   /* too late: skip rendering */
+        if (late > LATE_DROP) { p->dropped++; return; }
     }
     video_render(p, f);
     p->shown++;
@@ -625,14 +605,6 @@ static AVCodecContext *open_decoder(const char *tag, AVStream *st)
 
 /* ------------------------------------------------------------------ opening the media */
 
-/*
- * Why two attempts:
- * FFmpeg decides which protocol to use by parsing the text before the first ':' of the URL.
- * For "sdmc:/videos/top.avi" it reads "sdmc" as a URL scheme and looks for a protocol named
- * "sdmc", which does not exist -> AVERROR_PROTOCOL_NOT_FOUND. Prefixing "file:" forces the
- * 'file' protocol. If the build has no 'file' protocol at all, attempt 2 reads through stdio
- * via a custom AVIOContext, which does not depend on any protocol being compiled in.
- */
 static int io_read(void *opaque, uint8_t *buf, int size)
 {
     Player *p = (Player *)opaque;
@@ -659,7 +631,7 @@ static int64_t io_seek(void *opaque, int64_t off, int whence)
 
 static void close_media(Player *p)
 {
-    if (p->fmt) avformat_close_input(&p->fmt);   /* does not free a custom pb */
+    if (p->fmt) avformat_close_input(&p->fmt);
     if (p->pb) { av_freep(&p->pb->buffer); avio_context_free(&p->pb); }
     if (p->fp) { fclose(p->fp); p->fp = NULL; }
 }
@@ -716,7 +688,7 @@ static bool open_media(Player *p)
         if (r < 0) {
             say("[%s] FAILED avformat_open_input (custom AVIO): %d = %s -> %s\n", p->tag, r,
                 av_make_error_string(err, sizeof(err), r), explain_err(r));
-            p->fmt = NULL;               /* freed by avformat_open_input on failure */
+            p->fmt = NULL;
             close_media(p);
             return false;
         }
@@ -742,7 +714,6 @@ static bool open_media(Player *p)
     return true;
 }
 
-/* open file + decoders + queues for one player; sets p->active on success */
 static bool player_prepare(Player *p)
 {
     if (!open_media(p)) return false;
@@ -779,7 +750,6 @@ static bool player_prepare(Player *p)
 
 /* ------------------------------------------------------------------ threads */
 
-/* demuxer: reads the file and dispatches packets; blocks only when a queue is full */
 static void reader_thread(void *arg)
 {
     Player *p = (Player *)arg;
@@ -799,11 +769,10 @@ static void reader_thread(void *arg)
     p->eof = true;
 }
 
-/* audio decoder + NDSP feeder (only started for the player that owns the sound) */
 static void audio_thread(void *arg)
 {
     Player *p = (Player *)arg;
-    while (!p->go && !g_quit) svcSleepThread(2000000LL);      /* wait for prebuffer */
+    while (!p->go && !g_quit) svcSleepThread(2000000LL);
     while (!g_quit) {
         AVPacket *pk = pq_pop(&p->aq);
         if (!pk) {
@@ -811,30 +780,25 @@ static void audio_thread(void *arg)
             pk = pq_pop(&p->aq);
             if (!pk) { if (e) break; svcSleepThread(2000000LL); continue; }
         }
-        if (p->audio_on) handle_audio(p, pk);                 /* else: just drain */
+        if (p->audio_on) handle_audio(p, pk);
         av_packet_free(&pk);
     }
-    if (!g_quit && p->audio_on) handle_audio(p, NULL);        /* flush decoder */
+    if (!g_quit && p->audio_on) handle_audio(p, NULL);
     __sync_synchronize();
     p->audio_done = true;
 }
 
-/* video decoder + drawing; one per player */
 static void video_thread(void *arg)
 {
     Player *p = (Player *)arg;
     while (!p->go && !g_quit) svcSleepThread(2000000LL);
 
-    /* start only once the audio master is really playing, so both videos begin together */
     Player *a = p->clock_src ? p->clock_src : p;
     if (a->audio_on && a->th_audio) {
         u64 t0 = osGetTime();
         while (!g_quit && !a->aud_ready && !a->audio_done && osGetTime() - t0 < 3000)
             svcSleepThread(2000000LL);
         if (!a->aud_ready) {
-            /* FIX: only disable audio if this player IS the audio master.
-             * A follower (TOP following BOT) must not disable the master's audio just
-             * because it started decoding early. */
             if (a == p) {
                 a->audio_on = false;
                 say("[%s] audio did not start within 3 s - audio disabled, using wall clock\n", p->tag);
@@ -844,9 +808,6 @@ static void video_thread(void *arg)
         }
     }
 
-    /* FIX: if we follow another player's clock, wait until that player has a base
-     * (either its audio or its wall clock has started) so our first frame is not
-     * compared against an uninitialised reference (which would drop everything). */
     if (p->clock_src) {
         u64 t0 = osGetTime();
         while (!g_quit && !master_ready(p) && osGetTime() - t0 < 3000)
@@ -858,10 +819,10 @@ static void video_thread(void *arg)
         while (g_paused && !g_quit) svcSleepThread(10000000LL);
         AVPacket *pk = pq_pop(&p->vq);
         if (!pk) {
-            bool e = p->eof;                       /* read BEFORE the second pop */
+            bool e = p->eof;
             pk = pq_pop(&p->vq);
             if (!pk) {
-                if (e) break;                      /* end of stream */
+                if (e) break;
                 if (!starving) { p->underruns++; starving = true; }
                 svcSleepThread(2000000LL);
                 continue;
@@ -871,7 +832,7 @@ static void video_thread(void *arg)
         handle_video(p, pk);
         av_packet_free(&pk);
     }
-    if (!g_quit) handle_video(p, NULL);            /* flush decoder */
+    if (!g_quit) handle_video(p, NULL);
     __sync_synchronize();
     p->video_done = true;
 }
@@ -879,7 +840,7 @@ static void video_thread(void *arg)
 static Thread make_thread(ThreadFunc fn, void *arg, size_t stack, int prio, int core)
 {
     Thread t = threadCreate(fn, arg, stack, prio, core, false);
-    if (!t) t = threadCreate(fn, arg, stack, prio, 0, false);   /* fallback: app core */
+    if (!t) t = threadCreate(fn, arg, stack, prio, 0, false);
     return t;
 }
 
@@ -906,17 +867,27 @@ static void player_free(Player *p)
 
 int main(void)
 {
-    static Player pl[2];                  /* 0 = TOP (top.avi), 1 = BOT (bot.avi) */
+    static Player pl[2];
     memset(pl, 0, sizeof(pl));
     pl[0].tag = "TOP"; pl[0].screen = GFX_TOP;    pl[0].scr_w = 400; pl[0].want_audio = false;
     pl[1].tag = "BOT"; pl[1].screen = GFX_BOTTOM; pl[1].scr_w = 320; pl[1].want_audio = true;
 
     gfxInitDefault();
     gfxSet3D(false);
+
+    /* CONFIGURATION VIDÉO : On force le format BGR8 pour les deux écrans.
+       On le fait AVANT d'initialiser la console pour que la console du haut s'adapte. */
     gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);
+    gfxSetScreenFormat(GFX_BOTTOM, GSP_BGR8_OES);
     gfxSetDoubleBuffering(GFX_TOP, false);
-    consoleInit(GFX_BOTTOM, NULL);
-    osSetSpeedupEnable(true);                      /* ignored on Old 3DS */
+    gfxSetDoubleBuffering(GFX_BOTTOM, false);
+
+    /* CONSOLE DE LOG : On met la console sur le HAUT pour ne pas détruire le framebuffer du bas.
+       Le printf() et say() écriront ici pendant le chargement. */
+    consoleInit(GFX_TOP, NULL);
+    consoleClear();
+
+    osSetSpeedupEnable(true);
     LightLock_Init(&g_gfx_lock);
 
     g_log = fopen("sdmc:/3ds/minivideo_log.txt", "w");
@@ -924,14 +895,13 @@ int main(void)
     av_log_set_callback(av_log_cb);
     check_ffmpeg_build();
 
-    /* ---- which files? */
     pl[0].present = find_file("top.avi", pl[0].path, sizeof(pl[0].path));
     pl[1].present = find_file("bot.avi", pl[1].path, sizeof(pl[1].path));
     bool legacy = false;
     if (!pl[0].present && !pl[1].present) {
         if (find_file(NULL, pl[0].path, sizeof(pl[0].path))) {
             pl[0].present = true;
-            pl[0].want_audio = true;               /* single-video mode keeps its sound */
+            pl[0].want_audio = true;
             legacy = true;
         }
     }
@@ -943,7 +913,6 @@ int main(void)
     if (pl[0].present) say("TOP file: %s\n", pl[0].path);
     if (pl[1].present) say("BOT file: %s\n", pl[1].path);
 
-    /* ---- open files and decoders (a failing file does not stop the other one) */
     for (int i = 0; i < 2; i++) {
         if (!pl[i].present) continue;
         if (!player_prepare(&pl[i])) {
@@ -956,7 +925,6 @@ int main(void)
         goto wait_exit;
     }
 
-    /* ---- audio: only the player with want_audio and a usable decoder */
     {
         Player *ap = NULL;
         for (int i = 0; i < 2; i++)
@@ -971,11 +939,9 @@ int main(void)
                 say("NDSP init failed (sdmc:/3ds/dspfirm.cdc missing?) - no sound\n");
             }
         }
-        /* top video follows the bottom video's audio clock when there is one */
         if (pl[0].active && pl[1].active && pl[1].audio_on) pl[0].clock_src = &pl[1];
     }
 
-    /* ---- threads. New 3DS family: workers + top decode on core 2, bottom decode on core 0 */
     {
         s32 prio = 0x30;
         svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
@@ -984,8 +950,8 @@ int main(void)
         bool n3ds = false;
         APT_CheckNew3DS(&n3ds);
         if (!n3ds) APT_SetAppCpuTimeLimit(30);
-        int wcore = n3ds ? 2 : 1;               /* readers + audio */
-        int vcore[2] = { n3ds ? 2 : 0, 0 };     /* decode threads: TOP, BOT */
+        int wcore = n3ds ? 2 : 1;
+        int vcore[2] = { n3ds ? 2 : 0, 0 };
         bool ok = true;
 
         for (int i = 0; i < 2; i++) {
@@ -1000,7 +966,6 @@ int main(void)
         say("threads started (%s)\n", n3ds ? "New 3DS family" : "Old 3DS");
     }
 
-    /* ---- prebuffer ~1.5 s of every video before starting, so playback does not stutter */
     {
         u64 tb0 = osGetTime();
         while (!g_quit) {
@@ -1018,6 +983,7 @@ int main(void)
                 bool vok = pq_count(&p->vq) >= pre || p->eof || pq_full(&p->vq);
                 bool aok = !p->audio_on || pq_count(&p->aq) > 0 || p->eof;
                 if (!(vok && aok)) all_ok = false;
+                /* Affichage de chargement sur le HAUT */
                 printf("\x1b[%d;1H%s buffering %3d/%3d   ", 27 + i, p->tag, pq_count(&p->vq), pre);
             }
             fflush(stdout);
@@ -1032,20 +998,15 @@ int main(void)
                     pq_count(&pl[i].vq), (unsigned)(pq_bytes(&pl[i].vq) >> 10), pq_count(&pl[i].aq));
     }
 
-    /* ---- the bottom screen switches from text to video: from now on, log file only */
-    if (!g_quit && pl[1].active) {
+    /* Dès que la lecture commence, on cache le texte pour ne pas gêner la vidéo */
+    if (!g_quit) {
         g_quiet = true;
-        gfxSetScreenFormat(GFX_BOTTOM, GSP_BGR8_OES);
-        gfxSetDoubleBuffering(GFX_BOTTOM, false);
-        u16 fw, fh;
-        u8 *fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh);
-        memset(fb, 0, (size_t)FB_W * 320 * 3);
+        consoleClear(); 
     }
 
     __sync_synchronize();
-    for (int i = 0; i < 2; i++) pl[i].go = true;          /* release all threads together */
+    for (int i = 0; i < 2; i++) pl[i].go = true;
 
-    /* ---- main thread: input, pause, statistics, completion */
     {
         u64 tstat = osGetTime(), tlog = tstat, pause_start = 0;
         while (!g_quit) {
@@ -1059,7 +1020,7 @@ int main(void)
                     g_paused = true;
                     if (g_ndsp) ndspChnSetPaused(ACH, true);
                 } else {
-                    g_paused_ms += osGetTime() - pause_start;   /* BEFORE releasing the threads */
+                    g_paused_ms += osGetTime() - pause_start;
                     if (g_ndsp) ndspChnSetPaused(ACH, false);
                     __sync_synchronize();
                     g_paused = false;
@@ -1078,16 +1039,7 @@ int main(void)
             u64 now = osGetTime();
             if (now - tstat >= 1000) {
                 tstat = now;
-                if (!g_quiet) {                              /* only when the bottom screen is text */
-                    for (int i = 0; i < 2; i++) {
-                        Player *p = &pl[i];
-                        if (!p->active) continue;
-                        printf("\x1b[%d;1H%s V:%3d shown:%d drop:%d starve:%d   ", 27 + i, p->tag,
-                               pq_count(&p->vq), p->shown, p->dropped, p->underruns);
-                    }
-                    fflush(stdout);
-                }
-                if (now - tlog >= 5000) {                    /* same info into the log every 5 s */
+                if (now - tlog >= 5000) {
                     tlog = now;
                     for (int i = 0; i < 2; i++) {
                         Player *p = &pl[i];
@@ -1102,7 +1054,6 @@ int main(void)
     }
 
     if (!g_quit) {
-        /* let queued audio finish */
         for (int pi = 0; pi < 2; pi++) {
             if (!pl[pi].audio_on || !pl[pi].aud_ready) continue;
             for (int i = 0; i < 3000 && !g_quit; i++) {
@@ -1116,10 +1067,8 @@ int main(void)
         }
     }
 
-    /* ---- give the bottom screen back to text and report */
     if (g_quiet) {
         g_quiet = false;
-        consoleInit(GFX_BOTTOM, NULL);
         consoleClear();
     }
     for (int i = 0; i < 2; i++)
@@ -1135,7 +1084,7 @@ wait_exit:
         gspWaitForVBlank();
     }
 
-    g_quit = true;                                         /* make sure every worker stops */
+    g_quit = true;
     for (int i = 0; i < 2; i++) player_free(&pl[i]);
     if (g_ndsp) { ndspChnWaveBufClear(ACH); ndspExit(); }
     if (g_log) { fclose(g_log); g_log = NULL; }
