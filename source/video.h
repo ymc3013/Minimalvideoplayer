@@ -2,9 +2,10 @@
 #ifndef VIDEO_H
 #define VIDEO_H
 
-#include <libavutil/frame.h>
-#include <libswscale/swscale.h>
 #include <3ds.h>
+#include <libavutil/frame.h>
+#include <libavutil/pixfmt.h>
+#include <libswscale/swscale.h>
 
 typedef struct {
     struct SwsContext *scaler;
@@ -12,8 +13,12 @@ typedef struct {
     int height;
 } VideoDecoder;
 
-int video_init(VideoDecoder *video, int sourceWidth,
-               int sourceHeight, enum AVPixelFormat sourceFormat);
+int video_init(
+    VideoDecoder *video,
+    int sourceWidth,
+    int sourceHeight,
+    enum AVPixelFormat sourceFormat
+);
 
 void video_display(VideoDecoder *video, AVFrame *frame);
 
