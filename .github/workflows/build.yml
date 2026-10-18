@@ -25,26 +25,30 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install devkitPro SDK and 3DS libraries
+      - name: Check devkitPro SDK
         shell: bash
         run: |
           set -eu
 
           export PATH="/opt/devkitpro/devkitARM/bin:/opt/devkitpro/tools/bin:$PATH"
 
-          command -v dkp-pacman
-
-          dkp-pacman -Sy --noconfirm
-          dkp-pacman -S --needed --noconfirm \
-            devkitARM \
-            3ds-dev \
-            citro2d \
-            citro3d \
-            libctru \
-            3ds-zlib
-
           command -v arm-none-eabi-gcc
           command -v make
+
+          if [ -z "${DEVKITPRO:-}" ]; then
+            echo "::error::DEVKITPRO is not defined in this container."
+            exit 1
+          fi
+
+          if [ -z "${DEVKITARM:-}" ]; then
+            echo "::error::DEVKITARM is not defined in this container."
+            exit 1
+          fi
+
+          if [ ! -f "$DEVKITARM/3ds_rules" ]; then
+            echo "::error::Cannot find $DEVKITARM/3ds_rules"
+            exit 1
+          fi
 
           echo "DEVKITPRO=$DEVKITPRO"
           echo "DEVKITARM=$DEVKITARM"
@@ -58,11 +62,11 @@ jobs:
             name="$1"
             result="$(find "$DEVKITPRO" \
               -type f \
-              -path '*/portlibs/nds/*' -prune \
-              -o -type f -name "$name" -print -quit)"
+              -name "$name" \
+              -print -quit)"
 
             if [ -z "$result" ]; then
-              echo "::error::Cannot find $name for the 3DS SDK"
+              echo "::error::Cannot find SDK library $name"
               exit 1
             fi
 
@@ -72,11 +76,12 @@ jobs:
           CTRU_DIR="$(find_library libctru.a)"
           CITRO2D_DIR="$(find_library libcitro2d.a)"
           CITRO3D_DIR="$(find_library libcitro3d.a)"
+
           ZLIB_DIR="$DEVKITPRO/portlibs/3ds/lib"
 
           if [ ! -s "$ZLIB_DIR/libz.a" ]; then
-            echo "::error::3DS zlib not found at $ZLIB_DIR/libz.a"
-            find "$DEVKITPRO/portlibs" -type f -name libz.a -print
+            echo "::error::3DS zlib library not found: $ZLIB_DIR/libz.a"
+            find "$DEVKITPRO" -type f -name libz.a -print
             exit 1
           fi
 
@@ -90,7 +95,7 @@ jobs:
           echo "libctru: $CTRU_DIR"
           echo "libcitro2d: $CITRO2D_DIR"
           echo "libcitro3d: $CITRO3D_DIR"
-          echo "3DS zlib: $ZLIB_DIR"
+          echo "zlib: $ZLIB_DIR"
 
       - name: Verify decoder libraries
         shell: bash
@@ -99,7 +104,7 @@ jobs:
 
           LIB="third_party/decoder/lib"
 
-          for lib in \
+          for name in \
             libswresample.a \
             libavformat.a \
             libswscale.a \
@@ -114,8 +119,8 @@ jobs:
             libmbedx509.a \
             libmbedcrypto.a
           do
-            if [ ! -s "$LIB/$lib" ]; then
-              echo "::error::Missing decoder library: $LIB/$lib"
+            if [ ! -s "$LIB/$name" ]; then
+              echo "::error::Missing or empty decoder library: $LIB/$name"
               exit 1
             fi
           done
@@ -149,7 +154,11 @@ jobs:
           make clean
           make -j2 V=1
 
-          test -s Minimalvideoplayer.3dsx
+          if [ ! -s Minimalvideoplayer.3dsx ]; then
+            echo "::error::Minimalvideoplayer.3dsx was not created."
+            exit 1
+          fi
+
           ls -lh Minimalvideoplayer.3dsx
 
       - name: Upload 3DSX artifact
