@@ -1,3 +1,4 @@
+
 name: Build Minimalvideoplayer
 
 on:
@@ -47,49 +48,74 @@ jobs:
           arm-none-eabi-gcc --version
           make --version
 
-      - name: Install required devkitPro packages
+      - name: Install 3DS development packages
         shell: bash
         run: |
           set -eu
+
           if ! command -v dkp-pacman >/dev/null 2>&1; then
-            echo "::error::dkp-pacman is missing from the container."
+            echo "::error::dkp-pacman is unavailable in this image."
             exit 1
           fi
 
-          # Update and install the exact SDK libs we need (explicit names)
-          sudo dkp-pacman -Sy --noconfirm
-          sudo dkp-pacman -S --needed --noconfirm \
-            devkitARM \
-            libctru \
-            citro2d \
-            citro3d \
-            arm-none-eabi-zlib
+          dkp-pacman -Syu --noconfirm 3ds-dev
 
-      - name: Show installed SDK library directories (debug)
+      - name: Inspect SDK libraries
         shell: bash
         run: |
           set -eu
+
           echo "DEVKITPRO=$DEVKITPRO"
-          echo "Listing expected library directories:"
-          ls -la "$DEVKITPRO" || true
-          ls -la "$DEVKITPRO/libctru/lib" || true
-          ls -la "$DEVKITPRO/citro2d/lib" || true
-          ls -la "$DEVKITPRO/citro3d/lib" || true
-          ls -la "$DEVKITPRO/libz/lib" || true
-          echo "Find libctru/libcitro2d/libcitro3d/libz:"
-          find "$DEVKITPRO" -type f \( -name "libctru.a" -o -name "libcitro2d.a" -o -name "libcitro3d.a" -o -name "libz.a" \) -print || true
+          echo "DEVKITARM=$DEVKITARM"
 
-      - name: Verify project files & bundled libs
+          find "$DEVKITPRO" -type f \
+            \( -name 'libctru.a' \
+            -o -name 'libcitro2d.a' \
+            -o -name 'libcitro3d.a' \
+            -o -name 'libz.a' \) -print
+
+          for lib in libctru.a libcitro2d.a libcitro3d.a libz.a; do
+            if ! find "$DEVKITPRO" -type f -name "$lib" \
+              -print -quit | grep -q .; then
+              echo "::error::Required SDK library not found: $lib"
+              exit 1
+            fi
+          done
+
+          test -f "$DEVKITARM/3ds_rules"
+
+      - name: Verify project and decoder archives
         shell: bash
         run: |
           set -eu
-          test -f Makefile
-          test -f source/main.c
-          test -f source/avi.c
-          test -f source/video.c
-          test -f source/audio.c
+
+          for file in \
+            Makefile \
+            source/main.c \
+            source/avi.c \
+            source/video.c \
+            source/audio.c
+          do
+            test -f "$file" || {
+              echo "::error::Missing file: $file"
+              exit 1
+            }
+          done
 
           LIB="third_party/decoder/lib"
+
+          # Support the alternate libavutil filename previously found.
+          if [ ! -f "$LIB/libavutil.a" ] &&
+             [ -f "$LIB/lubavutil.a" ]; then
+            ln -s lubavutil.a "$LIB/libavutil.a"
+          fi
+
+          # Support the extensionless filename previously reported.
+          if [ ! -f "$LIB/libnghttp2.a" ] &&
+             [ -f "$LIB/libnghttp2." ]; then
+            ln -s 'libnghttp2.' "$LIB/libnghttp2.a"
+          fi
+
           for lib in \
             libswresample.a \
             libavformat.a \
@@ -100,18 +126,18 @@ jobs:
             libmp3lame.a \
             libdav1d.a \
             libcurl.a \
+            libnghttp2.a \
             libmbedtls.a \
             libmbedx509.a \
-            libmbedcrypto.a \
-            libnghttp2.a
+            libmbedcrypto.a
           do
             if [ ! -s "$LIB/$lib" ]; then
-              echo "::error::Missing library: $LIB/$lib"
+              echo "::error::Missing or empty archive: $LIB/$lib"
               exit 1
             fi
           done
 
-          echo "Project dependencies verified."
+          echo "Decoder archive checks passed."
 
       - name: Build Minimalvideoplayer
         shell: bash
@@ -120,7 +146,7 @@ jobs:
 
           export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
 
-          # Avoid linking against the incompatible bundled libctru.
+          # Do not use the bundled libctru archive.
           BUNDLED="third_party/decoder/lib/libctru.a"
           DISABLED="third_party/decoder/lib/libctru.a.disabled"
 
