@@ -1,6 +1,6 @@
 /*
- * Minimal AVI player - dual video version for Nintendo 3DS (devkitARM + libctru + FFmpeg)
- * Chargement séquentiel et thread-safe.
+ * Minimal AVI player - dual video version for Nintendo 3DS
+ * Version sans conflit mémoire (pas d'affichage texte à l'écran pendant la vidéo).
  */
 
 #include <3ds.h>
@@ -112,9 +112,8 @@ static volatile bool g_quit;
 static volatile bool g_paused;
 static volatile u64  g_paused_ms;
 static bool          g_ndsp;
-static volatile bool g_quiet;
 static FILE         *g_log;
-static LightLock     g_gfx_lock; /* Protège TOUT le rendu graphique 3DS */
+static LightLock     g_gfx_lock;
 
 /* ------------------------------------------------------------------ logging */
 
@@ -125,7 +124,6 @@ static void say(const char *f, ...)
     va_start(v, f);
     vsnprintf(b, sizeof(b), f, v);
     va_end(v);
-    if (!g_quiet) fputs(b, stdout);
     if (g_log) { fputs(b, g_log); fflush(g_log); }
 }
 
@@ -136,7 +134,6 @@ static void av_log_cb(void *ptr, int level, const char *fmt, va_list vl)
     char line[512];
     vsnprintf(line, sizeof(line), fmt, vl);
     if (g_log) { fputs(line, g_log); fflush(g_log); }
-    if (!g_quiet && level <= AV_LOG_WARNING) fputs(line, stdout);
 }
 
 static void check_ffmpeg_build(void)
@@ -144,10 +141,8 @@ static void check_ffmpeg_build(void)
     unsigned rf = avformat_version(), rc = avcodec_version(), ru = avutil_version();
     say("FFmpeg: avformat %u.%u avcodec %u.%u avutil %u.%u\n",
         rf >> 16, (rf >> 8) & 255, rc >> 16, (rc >> 8) & 255, ru >> 16, (ru >> 8) & 255);
-
     const AVInputFormat *avi = av_find_input_format("avi");
     say("demuxer 'avi': %s\n", avi ? "present" : "MISSING");
-
     if (g_log) fprintf(g_log, "FFmpeg config: %s\n", avformat_configuration());
 }
 
@@ -411,7 +406,6 @@ static void video_render(Player *p, const AVFrame *f)
     sws_scale(p->sws, (const uint8_t * const *)f->data, f->linesize, 0, f->height,
               p->dst_data, p->dst_linesize);
 
-    /* VERROU GLOBAL : gfxGetFramebuffer et gfxScreenSwapBuffers ne sont pas thread-safe */
     LightLock_Lock(&g_gfx_lock);
     u16 fw, fh;
     u8 *fb = gfxGetFramebuffer(p->screen, GFX_LEFT, &fw, &fh);
@@ -573,7 +567,6 @@ static void close_media(Player *p)
 
 static bool open_media(Player *p)
 {
-    char err[AV_ERROR_MAX_STRING_SIZE];
     char url[600];
     int r;
 
@@ -753,9 +746,7 @@ int main(void)
     gfxSetDoubleBuffering(GFX_TOP, false);
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
 
-    consoleInit(GFX_TOP, NULL); /* Console sur le haut */
-    consoleClear();
-
+    /* AUCUNE CONSOLE À L'ÉCRAN ! On écrit tout dans le fichier de log pour éviter le crash mémoire */
     osSetSpeedupEnable(true);
     LightLock_Init(&g_gfx_lock);
 
@@ -831,9 +822,10 @@ int main(void)
         for (int i = 0; i < 2; i++) {
             Player *p = &pl[i];
             if (!p->active) continue;
-            p->th_reader = make_thread(reader_thread, p, 128 * 1024, wprio, wcore);
-            p->th_video  = make_thread(video_thread,  p, 512 * 1024, prio,  vcore[i]);
-            if (p->audio_on) p->th_audio = make_thread(audio_thread, p, 256 * 1024, wprio, wcore);
+            /* AUGMENTATION MASSIVE DES PILES POUR FFMPEG */
+            p->th_reader = make_thread(reader_thread, p, 512 * 1024, wprio, wcore);
+            p->th_video  = make_thread(video_thread,  p, 1024 * 1024, prio,  vcore[i]);
+            if (p->audio_on) p->th_audio = make_thread(audio_thread, p, 512 * 1024, wprio, wcore);
         }
     }
 
@@ -854,19 +846,11 @@ int main(void)
                 bool vok = pq_count(&p->vq) >= pre || p->eof || pq_full(&p->vq);
                 bool aok = !p->audio_on || pq_count(&p->aq) > 0 || p->eof;
                 if (!(vok && aok)) all_ok = false;
-                printf("\x1b[%d;1H%s buffering %3d/%3d   ", 27 + i, p->tag, pq_count(&p->vq), pre);
             }
-            fflush(stdout);
             if (all_ok) break;
             if (osGetTime() - tb0 > 10000) break;
             svcSleepThread(20000000LL);
         }
-    }
-
-    /* Cacher le texte pour ne pas écraser les framebuffers */
-    if (!g_quit) {
-        g_quiet = true;
-        consoleClear(); 
     }
 
     __sync_synchronize();
@@ -918,12 +902,6 @@ int main(void)
             }
         }
     }
-
-    if (g_quiet) {
-        g_quiet = false;
-        consoleClear();
-    }
-    if (!g_quit) say("Fin. START pour quitter.\n");
 
 wait_exit:
     while (!g_quit && aptMainLoop()) {
