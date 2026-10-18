@@ -40,15 +40,56 @@ jobs:
             exit 1
           }
 
+          export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
           echo "$DEVKITARM/bin" >> "$GITHUB_PATH"
           echo "$DEVKITPRO/tools/bin" >> "$GITHUB_PATH"
 
-          export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
-
-          echo "DEVKITPRO=$DEVKITPRO"
-          echo "DEVKITARM=$DEVKITARM"
+          command -v arm-none-eabi-gcc
           arm-none-eabi-gcc --version
           make --version
+
+      - name: Install official 3DS libraries
+        shell: bash
+        run: |
+          set -eu
+
+          if ! command -v dkp-pacman >/dev/null 2>&1; then
+            echo "::error::dkp-pacman is missing from the container."
+            echo "The devkitPro package manager must be available."
+            exit 1
+          fi
+
+          dkp-pacman -Sy --noconfirm
+          dkp-pacman -S --needed --noconfirm \
+            3ds-dev \
+            3ds-zlib
+
+      - name: Verify SDK libraries
+        shell: bash
+        run: |
+          set -eu
+
+          echo "=== SDK library locations ==="
+
+          for lib in \
+            libctru.a \
+            libcitro2d.a \
+            libcitro3d.a \
+            libz.a
+          do
+            echo "--- $lib ---"
+            find "$DEVKITPRO" -type f -name "$lib" -print
+          done
+
+          echo "=== Required libraries ==="
+
+          for lib in libctru.a libcitro2d.a libcitro3d.a; do
+            if ! find "$DEVKITPRO" -type f -name "$lib" \
+              -print -quit | grep -q .; then
+              echo "::error::SDK library not found: $lib"
+              exit 1
+            fi
+          done
 
       - name: Verify project files
         shell: bash
@@ -57,54 +98,51 @@ jobs:
 
           test -f Makefile
           test -f source/main.c
+          test -f source/avi.c
+          test -f source/video.c
+          test -f source/audio.c
 
-          for file in \
-            third_party/decoder/include/libavformat/avformat.h \
-            third_party/decoder/include/libavcodec/avcodec.h \
-            third_party/decoder/lib/libswresample.a \
-            third_party/decoder/lib/libavformat.a \
-            third_party/decoder/lib/libswscale.a \
-            third_party/decoder/lib/libavcodec.a
+          LIB="third_party/decoder/lib"
+
+          for lib in \
+            libswresample.a \
+            libavformat.a \
+            libswscale.a \
+            libavcodec.a \
+            libx264.a \
+            libmp3lame.a \
+            libdav1d.a \
+            libcurl.a \
+            libmbedtls.a \
+            libmbedx509.a \
+            libmbedcrypto.a
           do
-            if [ ! -f "$file" ]; then
-              echo "::error::Missing dependency: $file"
+            test -s "$LIB/$lib" || {
+              echo "::error::Missing library: $LIB/$lib"
               exit 1
-            fi
+            }
           done
 
-          if [ ! -f third_party/decoder/lib/libavutil.a ]; then
-            if [ -f third_party/decoder/lib/lubavutil.a ]; then
-              ln -s lubavutil.a third_party/decoder/lib/libavutil.a
+          if [ ! -f "$LIB/libavutil.a" ]; then
+            if [ -f "$LIB/lubavutil.a" ]; then
+              ln -s lubavutil.a "$LIB/libavutil.a"
             else
-              echo "::error::Missing libavutil.a and lubavutil.a"
+              echo "::error::libavutil.a is missing."
               exit 1
             fi
           fi
 
-          echo "Project files verified."
+          if [ ! -f "$LIB/libnghttp2.a" ] &&
+             [ -f "$LIB/libnghttp2." ]; then
+            ln -s 'libnghttp2.' "$LIB/libnghttp2.a"
+          fi
 
-      - name: Locate SDK libraries
-        shell: bash
-        run: |
-          set -eu
+          test -s "$LIB/libnghttp2.a" || {
+            echo "::error::libnghttp2.a is missing."
+            exit 1
+          }
 
-          echo "=== SDK configuration ==="
-          echo "DEVKITPRO=$DEVKITPRO"
-          echo "DEVKITARM=$DEVKITARM"
-
-          echo "=== System library archives ==="
-          for lib in libctru.a libcitro2d.a libcitro3d.a libz.a; do
-            echo "--- $lib ---"
-            find "$DEVKITPRO" -type f -name "$lib" -print || true
-          done
-
-          echo "=== Compiler search directories ==="
-          arm-none-eabi-gcc -print-search-dirs
-
-          echo "=== 3DS build rules ==="
-          test -f "$DEVKITARM/3ds_rules"
-          grep -nE 'LIBDIRS|LDFLAGS|LIBS|DEVKITPRO|PORTLIBS' \
-            "$DEVKITARM/3ds_rules" || true
+          echo "Project dependencies verified."
 
       - name: Build Minimalvideoplayer
         shell: bash
@@ -113,56 +151,33 @@ jobs:
 
           export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
 
-          # Prevent the old bundled libctru from shadowing the SDK.
-          BUNDLED_CTRU="third_party/decoder/lib/libctru.a"
-          DISABLED_CTRU="third_party/decoder/lib/libctru.a.disabled"
+          # Avoid linking against the incompatible bundled libctru.
+          BUNDLED="third_party/decoder/lib/libctru.a"
+          DISABLED="third_party/decoder/lib/libctru.a.disabled"
 
-          if [ -e "$DISABLED_CTRU" ]; then
-            echo "::error::Unexpected libctru.a.disabled file."
+          if [ -e "$DISABLED" ]; then
+            echo "::error::Unexpected leftover $DISABLED"
             exit 1
           fi
 
           restore_ctru() {
-            if [ -e "$DISABLED_CTRU" ]; then
-              mv "$DISABLED_CTRU" "$BUNDLED_CTRU"
+            if [ -e "$DISABLED" ]; then
+              mv "$DISABLED" "$BUNDLED"
             fi
           }
-
           trap restore_ctru EXIT
 
-          if [ -f "$BUNDLED_CTRU" ]; then
-            mv "$BUNDLED_CTRU" "$DISABLED_CTRU"
-            echo "Temporarily disabled bundled libctru.a."
+          if [ -f "$BUNDLED" ]; then
+            mv "$BUNDLED" "$DISABLED"
           fi
 
           make clean
-
-          # Preserve the complete linker output if the build fails.
-          set +e
           make -j2 V=1
-          BUILD_STATUS=$?
-          set -e
 
-          if [ "$BUILD_STATUS" -ne 0 ]; then
-            echo "::error::Build failed with exit code $BUILD_STATUS."
-            echo "=== Available SDK libraries ==="
-            find "$DEVKITPRO" -type f \
-              \( -name 'libctru.a' -o \
-                 -name 'libcitro2d.a' -o \
-                 -name 'libcitro3d.a' -o \
-                 -name 'libz.a' \) -print || true
-            exit "$BUILD_STATUS"
-          fi
-
-          if [ ! -s Minimalvideoplayer.3dsx ]; then
-            echo "::error::The 3DSX output is missing or empty."
-            exit 1
-          fi
-
+          test -s Minimalvideoplayer.3dsx
           ls -lh Minimalvideoplayer.3dsx
 
       - name: Upload 3DSX artifact
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: Minimalvideoplayer-3dsx
