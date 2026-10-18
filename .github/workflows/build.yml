@@ -1,84 +1,22 @@
-name: Build Minimalvideoplayer
+TARGET := Minimalvideoplayer
+BUILD := build
+SOURCES := source
+INCLUDES := include library/include
+LIBDIRS := library/lib
 
-on:
-  push:
-  workflow_dispatch:
+ARCH := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 
-permissions:
-  contents: read
+CFLAGS := -g -O2 -Wall -ffunction-sections -fdata-sections $(ARCH)
+CFLAGS += -D__3DS__
+CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions
+ASFLAGS := $(ARCH)
+LDFLAGS := -specs=3dsx.specs $(ARCH) -Wl,--gc-sections
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    container:
-      image: devkitpro/devkitarm:latest
+LIBS := -lswresample -lavformat -lswscale -lavcodec -lavutil
+LIBS += -lx264 -lmp3lame -ldav1d -lz -lm -lctru
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+APP_TITLE := Minimal Video Player
+APP_DESCRIPTION := Automatic AVI Player
+APP_AUTHOR := ymc3013
 
-      - name: Prepare dependencies
-        shell: bash
-        run: |
-          set -eux
-          git clone --depth 1 \
-            https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
-            /tmp/reference
-
-          mkdir -p library/include library/lib build
-          cp -a /tmp/reference/library/include/. library/include/
-          cp -a /tmp/reference/library/lib/. library/lib/
-          rm -f library/lib/libctru.a
-
-      - name: Generate correct Makefile
-        shell: bash
-        run: |
-          set -eux
-          cat > Makefile <<'MAKEFILE'
-          TARGET := Minimalvideoplayer
-          BUILD := build
-          SOURCES := source
-          INCLUDES := include library/include
-          LIBDIRS := library/lib
-
-          ARCH := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
-
-          CFLAGS := -g -O2 -Wall -ffunction-sections -fdata-sections $(ARCH)
-          CFLAGS += -D__3DS__
-          CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions
-          ASFLAGS := $(ARCH)
-          LDFLAGS := -specs=3dsx.specs $(ARCH) -Wl,--gc-sections
-
-          LIBS := -lswresample -lavformat -lswscale -lavcodec -lavutil
-          LIBS += -lx264 -lmp3lame -ldav1d -lz -lm -lctru
-
-          APP_TITLE := Minimal Video Player
-          APP_DESCRIPTION := Automatic AVI Player
-          APP_AUTHOR := ymc3013
-
-          include $(DEVKITPRO)/devkitARM/3ds_rules
-          MAKEFILE
-
-          if grep -q '$(MAKE).*3ds_rules' Makefile; then
-            echo "Invalid recursive Makefile detected"
-            exit 1
-          fi
-
-      - name: Build
-        shell: bash
-        run: |
-          set -eux
-          export DEVKITPRO=/opt/devkitpro
-          export DEVKITARM=/opt/devkitpro/devkitARM
-          rm -rf build
-          make
-
-      - name: Verify output
-        run: test -s Minimalvideoplayer.3dsx
-
-      - name: Upload 3DSX
-        uses: actions/upload-artifact@v4
-        with:
-          name: Minimalvideoplayer-3DS
-          path: Minimalvideoplayer.3dsx
-          if-no-files-found: error
+include $(DEVKITARM)/3ds_rules
