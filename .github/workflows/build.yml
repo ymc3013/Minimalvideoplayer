@@ -25,42 +25,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure devkitPro
-        shell: bash
-        run: |
-          set -eu
-
-          test -n "${DEVKITPRO:-}" || {
-            echo "::error::DEVKITPRO is not configured."
-            exit 1
-          }
-
-          test -n "${DEVKITARM:-}" || {
-            echo "::error::DEVKITARM is not configured."
-            exit 1
-          }
-
-          export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
-          echo "$DEVKITARM/bin" >> "$GITHUB_PATH"
-          echo "$DEVKITPRO/tools/bin" >> "$GITHUB_PATH"
-
-          command -v arm-none-eabi-gcc
-          arm-none-eabi-gcc --version
-          make --version
-
-      - name: Install 3DS development packages
+      - name: Install Nintendo 3DS SDK
         shell: bash
         run: |
           set -eu
 
           if ! command -v dkp-pacman >/dev/null 2>&1; then
-            echo "::error::dkp-pacman is unavailable in this image."
+            echo "::error::devkitPro package manager is unavailable."
             exit 1
           fi
 
-          dkp-pacman -Syu --noconfirm 3ds-dev
+          dkp-pacman -Sy --noconfirm
+          dkp-pacman -S --needed --noconfirm 3ds-dev 3ds-zlib
 
-      - name: Inspect SDK libraries
+      - name: Locate SDK libraries
         shell: bash
         run: |
           set -eu
@@ -68,49 +46,41 @@ jobs:
           echo "DEVKITPRO=$DEVKITPRO"
           echo "DEVKITARM=$DEVKITARM"
 
-          find "$DEVKITPRO" -type f \
-            \( -name 'libctru.a' \
-            -o -name 'libcitro2d.a' \
-            -o -name 'libcitro3d.a' \
-            -o -name 'libz.a' \) -print
-
-          for lib in libctru.a libcitro2d.a libcitro3d.a libz.a; do
-            if ! find "$DEVKITPRO" -type f -name "$lib" \
-              -print -quit | grep -q .; then
-              echo "::error::Required SDK library not found: $lib"
-              exit 1
-            fi
+          for tool in arm-none-eabi-gcc make; do
+            command -v "$tool"
           done
 
           test -f "$DEVKITARM/3ds_rules"
 
-      - name: Verify project and decoder archives
+          for lib in \
+            libctru.a \
+            libcitro2d.a \
+            libcitro3d.a \
+            libz.a
+          do
+            echo "=== $lib ==="
+            find "$DEVKITPRO" -type f -name "$lib" -print
+
+            if ! find "$DEVKITPRO" -type f -name "$lib" \
+              -print -quit | grep -q .; then
+              echo "::error::SDK library missing: $lib"
+              exit 1
+            fi
+          done
+
+      - name: Verify decoder libraries
         shell: bash
         run: |
           set -eu
 
-          for file in \
-            Makefile \
-            source/main.c \
-            source/avi.c \
-            source/video.c \
-            source/audio.c
-          do
-            test -f "$file" || {
-              echo "::error::Missing file: $file"
-              exit 1
-            }
-          done
-
           LIB="third_party/decoder/lib"
 
-          # Support the alternate libavutil filename previously found.
+          # Handle the alternate filenames previously reported.
           if [ ! -f "$LIB/libavutil.a" ] &&
              [ -f "$LIB/lubavutil.a" ]; then
             ln -s lubavutil.a "$LIB/libavutil.a"
           fi
 
-          # Support the extensionless filename previously reported.
           if [ ! -f "$LIB/libnghttp2.a" ] &&
              [ -f "$LIB/libnghttp2." ]; then
             ln -s 'libnghttp2.' "$LIB/libnghttp2.a"
@@ -132,12 +102,10 @@ jobs:
             libmbedcrypto.a
           do
             if [ ! -s "$LIB/$lib" ]; then
-              echo "::error::Missing or empty archive: $LIB/$lib"
+              echo "::error::Missing decoder archive: $LIB/$lib"
               exit 1
             fi
           done
-
-          echo "Decoder archive checks passed."
 
       - name: Build Minimalvideoplayer
         shell: bash
@@ -146,7 +114,7 @@ jobs:
 
           export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
 
-          # Do not use the bundled libctru archive.
+          # Temporarily exclude the bundled libctru archive.
           BUNDLED="third_party/decoder/lib/libctru.a"
           DISABLED="third_party/decoder/lib/libctru.a.disabled"
 
