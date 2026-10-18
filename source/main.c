@@ -1,4 +1,3 @@
-
 #include <3ds.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +18,9 @@
 #define VIDEO_PATH "sdmc:/Movies/test.avi"
 #define SCREEN_W 400
 #define SCREEN_H 240
+#define FB_WIDTH 240
+#define FB_HEIGHT 400
+
 #define AUDIO_RATE 44100
 #define AUDIO_CHANNELS 2
 #define AUDIO_BUFFER_SAMPLES 4096
@@ -29,19 +31,17 @@ static ndspWaveBuf audioBuffers[AUDIO_BUFFER_COUNT];
 static int16_t *audioMemory[AUDIO_BUFFER_COUNT];
 static int audioIndex = 0;
 
-/*
- * Lecture d'un fichier via stdio/libctru.
- * FFmpeg utilise ce callback au lieu de chercher un protocole "sdmc".
- */
-static int read_file_packet(void *opaque, uint8_t *buffer, int buffer_size)
+static int read_file_packet(
+    void *opaque,
+    uint8_t *buffer,
+    int buffer_size)
 {
     FILE *file = (FILE *)opaque;
-    size_t count;
 
     if (buffer_size <= 0)
         return AVERROR(EINVAL);
 
-    count = fread(buffer, 1, (size_t)buffer_size, file);
+    size_t count = fread(buffer, 1, (size_t)buffer_size, file);
 
     if (count > 0)
         return (int)count;
@@ -52,12 +52,10 @@ static int read_file_packet(void *opaque, uint8_t *buffer, int buffer_size)
     return AVERROR(errno ? errno : EIO);
 }
 
-/*
- * Permet à FFmpeg de connaître la taille du fichier et de se déplacer
- * dans l'AVI. fseek/ftell sont utilisés pour rester compatibles avec
- * la bibliothèque C de la Nintendo 3DS.
- */
-static int64_t seek_file_packet(void *opaque, int64_t offset, int whence)
+static int64_t seek_file_packet(
+    void *opaque,
+    int64_t offset,
+    int whence)
 {
     FILE *file = (FILE *)opaque;
     long current;
@@ -66,6 +64,7 @@ static int64_t seek_file_packet(void *opaque, int64_t offset, int whence)
 
     if (whence == AVSEEK_SIZE) {
         current = ftell(file);
+
         if (current < 0)
             return AVERROR(errno ? errno : EIO);
 
@@ -109,6 +108,7 @@ static int64_t seek_file_packet(void *opaque, int64_t offset, int whence)
         return AVERROR(errno ? errno : EIO);
 
     current = ftell(file);
+
     if (current < 0)
         return AVERROR(errno ? errno : EIO);
 
@@ -122,6 +122,7 @@ static void show_error(const char *message, int error)
     av_strerror(error, text, sizeof(text));
 
     consoleInit(GFX_TOP, NULL);
+
     printf("%s\n%s\n", message, text);
     printf("\nSTART pour quitter.");
 
@@ -135,21 +136,29 @@ static void show_error(const char *message, int error)
     }
 }
 
-static void display_frame(struct SwsContext *scaler,
-                          AVFrame *frame,
-                          uint8_t *rgb,
-                          int rgbStride)
+static void display_frame(
+    struct SwsContext *scaler,
+    AVFrame *frame,
+    uint8_t *rgb,
+    int rgbStride)
 {
-    uint8_t *destData[4] = { rgb, NULL, NULL, NULL };
-    int destStride[4] = { rgbStride, 0, 0, 0 };
+    uint8_t *destData[4] = {
+        rgb, NULL, NULL, NULL
+    };
 
-    sws_scale(scaler,
-              (const uint8_t * const *)frame->data,
-              frame->linesize,
-              0,
-              frame->height,
-              destData,
-              destStride);
+    int destStride[4] = {
+        rgbStride, 0, 0, 0
+    };
+
+    sws_scale(
+        scaler,
+        (const uint8_t * const *)frame->data,
+        frame->linesize,
+        0,
+        frame->height,
+        destData,
+        destStride
+    );
 
     u16 width = 0;
     u16 height = 0;
@@ -161,11 +170,18 @@ static void display_frame(struct SwsContext *scaler,
         &height
     );
 
-    if (!fb || width != SCREEN_W || height != SCREEN_H)
+    /*
+     * Le framebuffer interne de l'écran supérieur est 240 x 400,
+     * alors que l'image vidéo est 400 x 240.
+     */
+    if (!fb || width != FB_WIDTH || height != FB_HEIGHT) {
+        gspWaitForVBlank();
         return;
+    }
 
     /*
-     * Copie de l'image convertie dans le framebuffer.
+     * Le framebuffer de la 3DS est stocké de côté.
+     * Le format par défaut est BGR8, pas RGB24.
      */
     for (int y = 0; y < SCREEN_H; y++) {
         for (int x = 0; x < SCREEN_W; x++) {
@@ -173,11 +189,14 @@ static void display_frame(struct SwsContext *scaler,
                 &rgb[y * rgbStride + x * 3];
 
             unsigned int pos =
-                ((SCREEN_H - 1 - y) * SCREEN_W + x) * 3;
+                (unsigned int)x * FB_HEIGHT
+                + (FB_HEIGHT - 1 - y);
 
-            fb[pos + 0] = pixel[0];
+            pos *= 3;
+
+            fb[pos + 0] = pixel[2];
             fb[pos + 1] = pixel[1];
-            fb[pos + 2] = pixel[2];
+            fb[pos + 2] = pixel[0];
         }
     }
 
@@ -193,6 +212,9 @@ static void queue_audio(const uint8_t *data, int samples)
 
     ndspWaveBuf *buf = &audioBuffers[audioIndex];
 
+    /*
+     * Attend que ce buffer ait fini d'être joué avant de le réutiliser.
+     */
     while (aptMainLoop() &&
            buf->status == NDSP_WBUF_PLAYING) {
         gspWaitForVBlank();
@@ -213,6 +235,7 @@ static void queue_audio(const uint8_t *data, int samples)
     buf->looping = false;
 
     DSP_FlushDataCache(audioMemory[audioIndex], bytes);
+
     ndspChnWaveBufAdd(0, buf);
 
     audioIndex = (audioIndex + 1) % AUDIO_BUFFER_COUNT;
@@ -246,9 +269,6 @@ int main(void)
     gfxInitDefault();
     gfxSet3D(false);
 
-    /*
-     * Allocation des buffers audio.
-     */
     for (int i = 0; i < AUDIO_BUFFER_COUNT; i++) {
         audioMemory[i] = linearAlloc(
             AUDIO_BUFFER_SAMPLES *
@@ -276,7 +296,7 @@ int main(void)
     ndspChnSetFormat(0, NDSP_FORMAT_STEREO_PCM16);
 
     /*
-     * Ouverture du fichier depuis la carte SD.
+     * Ouverture du fichier AVI depuis la carte SD.
      */
     videoFile = fopen(VIDEO_PATH, "rb");
 
@@ -286,11 +306,11 @@ int main(void)
     }
 
     /*
-     * Création du contexte d'entrée personnalisé.
+     * Fournit à FFmpeg une entrée personnalisée pour éviter
+     * l'erreur de protocole liée à sdmc:.
      */
     {
-        uint8_t *ioBuffer =
-            (uint8_t *)av_malloc(IO_BUFFER_SIZE);
+        uint8_t *ioBuffer = av_malloc(IO_BUFFER_SIZE);
 
         if (!ioBuffer) {
             result = AVERROR(ENOMEM);
@@ -324,10 +344,6 @@ int main(void)
     format->pb = customIO;
     format->flags |= AVFMT_FLAG_CUSTOM_IO;
 
-    /*
-     * NULL comme nom de fichier :
-     * FFmpeg lit les données via notre AVIOContext.
-     */
     result = avformat_open_input(
         &format,
         NULL,
@@ -366,7 +382,7 @@ int main(void)
     }
 
     /*
-     * Initialisation du décodeur vidéo.
+     * Initialise le décodeur vidéo.
      */
     {
         AVCodecParameters *params =
@@ -403,9 +419,6 @@ int main(void)
             goto error;
     }
 
-    /*
-     * Conversion de l'image vers le format RGB affichable.
-     */
     scaler = sws_getContext(
         videoCodec->width,
         videoCodec->height,
@@ -440,7 +453,7 @@ int main(void)
     }
 
     /*
-     * Initialisation du décodeur audio si le fichier en possède un.
+     * Initialise le décodeur audio si le fichier possède une piste audio.
      */
     if (audioStream >= 0) {
         AVCodecParameters *params =
@@ -516,7 +529,7 @@ int main(void)
     }
 
     /*
-     * Boucle principale de lecture.
+     * Lecture des paquets vidéo et audio.
      */
     while (aptMainLoop() &&
            av_read_frame(format, packet) >= 0) {
@@ -629,9 +642,6 @@ cleanup:
 
     avformat_close_input(&format);
 
-    /*
-     * Le contexte AVIO personnalisé doit être libéré séparément.
-     */
     if (customIO) {
         av_freep(&customIO->buffer);
         avio_context_free(&customIO);
