@@ -25,7 +25,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure devkitPro environment
+      - name: Configure devkitPro
         shell: bash
         run: |
           set -eu
@@ -40,14 +40,13 @@ jobs:
             exit 1
           }
 
-          export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
-
           echo "$DEVKITARM/bin" >> "$GITHUB_PATH"
           echo "$DEVKITPRO/tools/bin" >> "$GITHUB_PATH"
 
+          export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
+
           echo "DEVKITPRO=$DEVKITPRO"
           echo "DEVKITARM=$DEVKITARM"
-
           arm-none-eabi-gcc --version
           make --version
 
@@ -56,55 +55,56 @@ jobs:
         run: |
           set -eu
 
-          test -f Makefile || {
-            echo "::error::Makefile is missing."
-            exit 1
-          }
-
-          test -f source/main.c || {
-            echo "::error::source/main.c is missing."
-            exit 1
-          }
+          test -f Makefile
+          test -f source/main.c
 
           for file in \
             third_party/decoder/include/libavformat/avformat.h \
             third_party/decoder/include/libavcodec/avcodec.h \
+            third_party/decoder/lib/libswresample.a \
             third_party/decoder/lib/libavformat.a \
-            third_party/decoder/lib/libavcodec.a \
             third_party/decoder/lib/libswscale.a \
-            third_party/decoder/lib/libswresample.a
+            third_party/decoder/lib/libavcodec.a
           do
-            test -f "$file" || {
+            if [ ! -f "$file" ]; then
               echo "::error::Missing dependency: $file"
               exit 1
-            }
+            fi
           done
 
           if [ ! -f third_party/decoder/lib/libavutil.a ]; then
             if [ -f third_party/decoder/lib/lubavutil.a ]; then
               ln -s lubavutil.a third_party/decoder/lib/libavutil.a
             else
-              echo "::error::Neither libavutil.a nor lubavutil.a exists."
+              echo "::error::Missing libavutil.a and lubavutil.a"
               exit 1
             fi
           fi
 
           echo "Project files verified."
 
-      - name: Diagnose libctru libraries
+      - name: Locate SDK libraries
         shell: bash
         run: |
           set -eu
 
-          echo "Libraries named libctru.a in devkitPro:"
-          find "$DEVKITPRO" -name libctru.a -type f -print || true
+          echo "=== SDK configuration ==="
+          echo "DEVKITPRO=$DEVKITPRO"
+          echo "DEVKITARM=$DEVKITARM"
 
-          echo "Bundled libctru:"
-          if [ -f third_party/decoder/lib/libctru.a ]; then
-            ls -lh third_party/decoder/lib/libctru.a
-          else
-            echo "No bundled libctru.a found."
-          fi
+          echo "=== System library archives ==="
+          for lib in libctru.a libcitro2d.a libcitro3d.a libz.a; do
+            echo "--- $lib ---"
+            find "$DEVKITPRO" -type f -name "$lib" -print || true
+          done
+
+          echo "=== Compiler search directories ==="
+          arm-none-eabi-gcc -print-search-dirs
+
+          echo "=== 3DS build rules ==="
+          test -f "$DEVKITARM/3ds_rules"
+          grep -nE 'LIBDIRS|LDFLAGS|LIBS|DEVKITPRO|PORTLIBS' \
+            "$DEVKITARM/3ds_rules" || true
 
       - name: Build Minimalvideoplayer
         shell: bash
@@ -113,12 +113,12 @@ jobs:
 
           export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
 
-          # Prevent the bundled libctru.a from shadowing the SDK copy.
+          # Prevent the old bundled libctru from shadowing the SDK.
           BUNDLED_CTRU="third_party/decoder/lib/libctru.a"
           DISABLED_CTRU="third_party/decoder/lib/libctru.a.disabled"
 
           if [ -e "$DISABLED_CTRU" ]; then
-            echo "::error::libctru.a.disabled already exists; inspect the repository."
+            echo "::error::Unexpected libctru.a.disabled file."
             exit 1
           fi
 
@@ -136,11 +136,29 @@ jobs:
           fi
 
           make clean
-          make -j2
 
-          test -s Minimalvideoplayer.3dsx
+          # Preserve the complete linker output if the build fails.
+          set +e
+          make -j2 V=1
+          BUILD_STATUS=$?
+          set -e
 
-          echo "Build successful:"
+          if [ "$BUILD_STATUS" -ne 0 ]; then
+            echo "::error::Build failed with exit code $BUILD_STATUS."
+            echo "=== Available SDK libraries ==="
+            find "$DEVKITPRO" -type f \
+              \( -name 'libctru.a' -o \
+                 -name 'libcitro2d.a' -o \
+                 -name 'libcitro3d.a' -o \
+                 -name 'libz.a' \) -print || true
+            exit "$BUILD_STATUS"
+          fi
+
+          if [ ! -s Minimalvideoplayer.3dsx ]; then
+            echo "::error::The 3DSX output is missing or empty."
+            exit 1
+          fi
+
           ls -lh Minimalvideoplayer.3dsx
 
       - name: Upload 3DSX artifact
