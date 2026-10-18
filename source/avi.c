@@ -1,59 +1,63 @@
-
 #include "avi.h"
 
+#include <stdio.h>
 #include <string.h>
 
-int avi_open(AviFile *avi, const char *path)
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+
+int avi_open(AVIContext *avi, const char *filename)
 {
-    if (!avi || !path)
-        return AVERROR(EINVAL);
+    if (avi == NULL || filename == NULL) {
+        return -1;
+    }
 
     memset(avi, 0, sizeof(*avi));
-    avi->videoStream = -1;
-    avi->audioStream = -1;
+    avi->video_stream = -1;
+    avi->audio_stream = -1;
 
-    int ret = avformat_open_input(&avi->format, path, NULL, NULL);
-    if (ret < 0)
-        return ret;
+    if (avformat_open_input(&avi->format, filename, NULL, NULL) < 0) {
+        fprintf(stderr, "AVI: impossible d'ouvrir %s\n", filename);
+        return -1;
+    }
 
-    ret = avformat_find_stream_info(avi->format, NULL);
-    if (ret < 0) {
-        avi_close(avi);
-        return ret;
+    if (avformat_find_stream_info(avi->format, NULL) < 0) {
+        fprintf(stderr, "AVI: informations de flux introuvables\n");
+        avformat_close_input(&avi->format);
+        return -1;
     }
 
     for (unsigned int i = 0; i < avi->format->nb_streams; i++) {
-        AVMediaType type = avi->format->streams[i]->codecpar->codec_type;
+        AVStream *stream = avi->format->streams[i];
+        enum AVMediaType type = stream->codecpar->codec_type;
 
-        if (type == AVMEDIA_TYPE_VIDEO && avi->videoStream < 0)
-            avi->videoStream = (int)i;
-
-        if (type == AVMEDIA_TYPE_AUDIO && avi->audioStream < 0)
-            avi->audioStream = (int)i;
+        if (type == AVMEDIA_TYPE_VIDEO && avi->video_stream < 0) {
+            avi->video_stream = (int)i;
+        } else if (type == AVMEDIA_TYPE_AUDIO && avi->audio_stream < 0) {
+            avi->audio_stream = (int)i;
+        }
     }
 
-    if (avi->videoStream < 0) {
-        avi_close(avi);
-        return AVERROR_STREAM_NOT_FOUND;
+    if (avi->video_stream < 0) {
+        fprintf(stderr, "AVI: aucune piste vidéo trouvée\n");
+        avformat_close_input(&avi->format);
+        avi->audio_stream = -1;
+        return -1;
     }
 
     return 0;
 }
 
-int avi_read_packet(AviFile *avi, AVPacket *packet)
+void avi_close(AVIContext *avi)
 {
-    if (!avi || !avi->format || !packet)
-        return AVERROR(EINVAL);
-
-    return av_read_frame(avi->format, packet);
-}
-
-void avi_close(AviFile *avi)
-{
-    if (!avi)
+    if (avi == NULL) {
         return;
+    }
 
-    avformat_close_input(&avi->format);
-    avi->videoStream = -1;
-    avi->audioStream = -1;
+    if (avi->format != NULL) {
+        avformat_close_input(&avi->format);
+    }
+
+    avi->video_stream = -1;
+    avi->audio_stream = -1;
 }
