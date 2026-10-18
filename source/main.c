@@ -1,8 +1,6 @@
 /*
  * Minimal AVI player - dual video version for Nintendo 3DS (devkitARM + libctru + FFmpeg)
  *
- * STATUS: NOT COMPILED, NOT TESTED (written without access to devkitARM or your FFmpeg build).
- *
  *   top.avi -> TOP screen    (400x240 area, picture only, its audio is ignored)
  *   bot.avi -> BOTTOM screen (320x240 area, picture + THE ONLY audio)
  *
@@ -117,7 +115,7 @@ typedef struct Player {
     /* fallback wall clock */
     u64       wall0;
     double    vbase_pts;
-    bool      have_vbase;
+    volatile bool have_vbase;
 
     /* pipeline */
     PQ        vq, aq;
@@ -222,6 +220,7 @@ static bool pq_init(PQ *p, int cap, size_t max_bytes)
 
 static bool pq_full(PQ *p)
 {
+    if (!p->q) return true;
     LightLock_Lock(&p->lock);
     bool f = p->count >= p->cap || p->bytes >= p->max_bytes;
     LightLock_Unlock(&p->lock);
@@ -253,7 +252,8 @@ static bool pq_push(PQ *p, AVPacket *src)
     if (!n) return false;
     av_packet_move_ref(n, src);
     LightLock_Lock(&p->lock);
-    if (p->count >= p->cap) {
+    /* FIX: also check max_bytes here, not just in pq_full() */
+    if (p->count >= p->cap || p->bytes >= p->max_bytes) {
         LightLock_Unlock(&p->lock);
         av_packet_free(&n);
         return false;
@@ -314,7 +314,7 @@ static double audio_clock(Audio *a)
     return a->last_clock;
 }
 
-/* queue n interleaved stereo S16 samples; waits (no timeout, pause-safe) if all buffers are busy */
+/* queue n interleaved stereo S16 samples; waits (pause-safe) if all buffers are busy */
 static bool audio_push(Player *p, const int16_t *src, int n)
 {
     Audio *a = &p->au;
@@ -322,6 +322,8 @@ static bool audio_push(Player *p, const int16_t *src, int n)
         ndspWaveBuf *wb = &a->wb[a->next];
         while (wb->status == NDSP_WBUF_QUEUED || wb->status == NDSP_WBUF_PLAYING) {
             if (g_quit) return false;
+            /* FIX: don't spin forever while paused - NDSP is paused too, buffers stay PLAYING */
+            if (g_paused) { svcSleepThread(10000000LL); continue; }
             svcSleepThread(2000000LL);                 /* 2 ms */
         }
         int chunk = n > ABUF_SAMPLES ? ABUF_SAMPLES : n;
@@ -479,12 +481,42 @@ static void video_render(Player *p, const AVFrame *f)
     LightLock_Unlock(&g_gfx_lock);
 }
 
+/*
+ * FIX: master_clock must return a sane value even if the master player has not
+ * started yet (no audio ready, no vbase). Otherwise the very first comparison in
+ * video_present() produces a huge "late" value and every frame is dropped.
+ *
+ * Semantics:
+ *   - If the master's audio is on and aud_ready:  audio_base + audio_clock()
+ *   - Else if the master has a wall clock base:    vbase_pts + wall elapsed
+ *   - Else: use OUR OWN wall clock base if we have one
+ *   - Else: return 0.0 (caller must treat this as "not started")
+ */
 static double master_clock(Player *p)
 {
     Player *a = p->clock_src ? p->clock_src : p;
+
     if (a->audio_on && a->aud_ready)
         return a->audio_base + audio_clock(&a->au);
-    return p->vbase_pts + (double)(osGetTime() - p->wall0 - g_paused_ms) / 1000.0;
+
+    /* master has no running clock: try the master's wall clock, then our own */
+    if (a->have_vbase && a->wall0)
+        return a->vbase_pts + (double)(osGetTime() - a->wall0 - g_paused_ms) / 1000.0;
+
+    if (p->have_vbase && p->wall0)
+        return p->vbase_pts + (double)(osGetTime() - p->wall0 - g_paused_ms) / 1000.0;
+
+    return 0.0;   /* no reference yet */
+}
+
+/* FIX: helper to know if we have a usable reference clock at all */
+static bool master_ready(Player *p)
+{
+    Player *a = p->clock_src ? p->clock_src : p;
+    if (a->audio_on && a->aud_ready) return true;
+    if (a->have_vbase && a->wall0)   return true;
+    if (p->have_vbase && p->wall0)   return true;
+    return false;
 }
 
 static void video_present(Player *p, const AVFrame *f, double pts)
@@ -494,9 +526,11 @@ static void video_present(Player *p, const AVFrame *f, double pts)
         p->vbase_pts = pts;
         p->wall0 = osGetTime();
     }
-    Player *a = p->clock_src ? p->clock_src : p;
-    /* if the audio master exists but has not started yet, show immediately (no reference clock) */
-    bool wait_ok = !(a->audio_on && !a->aud_ready);
+
+    /* FIX: only wait on the master clock when the master actually has a clock.
+     * Previously, a not-yet-started audio master made wait_ok==false (immediate draw),
+     * but the subsequent "late" computation produced a huge value and dropped everything. */
+    bool wait_ok = master_ready(p);
 
     if (wait_ok) {
         int waited = 0;
@@ -798,10 +832,25 @@ static void video_thread(void *arg)
         while (!g_quit && !a->aud_ready && !a->audio_done && osGetTime() - t0 < 3000)
             svcSleepThread(2000000LL);
         if (!a->aud_ready) {
-            /* give up on audio: videos fall back to the wall clock instead of racing ahead */
-            a->audio_on = false;
-            say("[%s] audio did not start within 3 s - audio disabled, using wall clock\n", p->tag);
+            /* FIX: only disable audio if this player IS the audio master.
+             * A follower (TOP following BOT) must not disable the master's audio just
+             * because it started decoding early. */
+            if (a == p) {
+                a->audio_on = false;
+                say("[%s] audio did not start within 3 s - audio disabled, using wall clock\n", p->tag);
+            } else {
+                say("[%s] master audio not ready after 3 s - using wall clock (master audio kept)\n", p->tag);
+            }
         }
+    }
+
+    /* FIX: if we follow another player's clock, wait until that player has a base
+     * (either its audio or its wall clock has started) so our first frame is not
+     * compared against an uninitialised reference (which would drop everything). */
+    if (p->clock_src) {
+        u64 t0 = osGetTime();
+        while (!g_quit && !master_ready(p) && osGetTime() - t0 < 3000)
+            svcSleepThread(2000000LL);
     }
 
     bool starving = false;
