@@ -1,5 +1,5 @@
 
-name: MinimalVideoPlayer - Autonomous Build
+name: MinimalVideoPlayer - First Frame
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    name: Build MinimalVideoPlayer
+    name: Build first-frame viewer
     runs-on: ubuntu-latest
     container:
       image: devkitpro/devkitarm:latest
@@ -19,7 +19,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Check devkitPro tools
+      - name: Check toolchain
         shell: bash
         run: |
           set -eu
@@ -28,244 +28,287 @@ jobs:
           command -v make
           command -v git
           command -v python3
-          command -v smdhtool
 
-      - name: Fetch decoder libraries
+      - name: Get decoder libraries and build rules
         shell: bash
         run: |
           set -eu
 
-          # Fetch the libraries only; never build or launch the old player.
           git clone --depth 1 \
             https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
-            /tmp/decoder-dependencies
+            /tmp/reference
 
-          test -d /tmp/decoder-dependencies/library/include
-          test -d /tmp/decoder-dependencies/library/lib
+          test -d /tmp/reference/library/include
+          test -d /tmp/reference/library/lib
+          test -f /tmp/reference/Makefile
 
-          mkdir -p source library
-          cp -a /tmp/decoder-dependencies/library/include/. \
-            library/include/
-          cp -a /tmp/decoder-dependencies/library/lib/. \
-            library/lib/
+          mkdir -p source library/include library/lib
 
-          for lib in avformat avcodec avutil swscale swresample; do
+          cp -a /tmp/reference/library/include/. library/include/
+          cp -a /tmp/reference/library/lib/. library/lib/
+          cp /tmp/reference/Makefile Makefile
+
+          for lib in avformat avcodec avutil swscale; do
             if ! find library/lib -maxdepth 1 \
               -name "lib${lib}.a" -print -quit | grep -q .; then
-              echo "Missing static decoder library: lib${lib}.a"
+              echo "Missing library: lib${lib}.a"
               exit 1
             fi
           done
 
-      - name: Generate application icon
+      - name: Configure standalone build rules
         shell: bash
         run: |
           set -eu
 
           python3 - <<'PY'
-          import struct
-          import zlib
           from pathlib import Path
+          import re
 
-          def chunk(name, data):
-              block = name + data
-              return (
-                  struct.pack(">I", len(data))
-                  + block
-                  + struct.pack(">I", zlib.crc32(block) & 0xffffffff)
-              )
+          p = Path("Makefile")
+          text = p.read_text()
 
-          width = height = 48
-          row = b"\x00" + bytes([28, 28, 42, 255]) * width
-          image = b"".join(row for _ in range(height))
+          settings = {
+              "TARGET": "Minimalvideoplayer",
+              "BUILD": "build",
+              "SOURCES": "source",
+              "DATA": "",
+              "INCLUDES": "library/include",
+              "GRAPHICS": "",
+              "ROMFS": "",
+              "GFXBUILD": "build",
+              "NO_SMDH": "1",
+              "APP_TITLE": "MinimalVideoPlayer",
+              "APP_DESCRIPTION": "AVI first frame viewer",
+              "APP_AUTHOR": "ymc3013",
+          }
 
-          png = (
-              b"\x89PNG\r\n\x1a\n"
-              + chunk(b"IHDR", struct.pack(
-                  ">IIBBBBB", width, height, 8, 6, 0, 0, 0
-              ))
-              + chunk(b"IDAT", zlib.compress(image))
-              + chunk(b"IEND", b"")
-          )
+          for key, value in settings.items():
+              pattern = rf"(?m)^{key}\s*:=.*$"
+              replacement = f"{key}\t:=\t{value}"
+              text, count = re.subn(pattern, replacement, text, count=1)
+              if count != 1:
+                  raise SystemExit(f"Cannot configure Makefile: {key}")
 
-          Path("icon.png").write_bytes(png)
+          p.write_text(text)
           PY
 
-      - name: Generate autonomous player source
+          grep -E '^(TARGET|SOURCES|INCLUDES|LIBDIRS|NO_SMDH)' Makefile
+
+      - name: Generate first-frame decoder
         shell: bash
         run: |
           set -eu
 
           cat > source/main.c <<'EOF'
-          #include <stdio.h>
           #include <3ds.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <stdint.h>
+          #include <string.h>
+
           #include <libavformat/avformat.h>
           #include <libavcodec/avcodec.h>
+          #include <libswscale/swscale.h>
+          #include <libavutil/pixfmt.h>
 
           #define VIDEO_PATH "sdmc:/Movies/test.avi"
+          #define SCREEN_W 400
+          #define SCREEN_H 240
+
+          static int display_frame(AVFrame *frame)
+          {
+              struct SwsContext *scale;
+              uint8_t *pixels;
+              uint8_t *fb;
+              int stride[4] = { SCREEN_W * 3, 0, 0, 0 };
+              uint8_t *dst[4];
+              u16 screen_w = 0;
+              u16 screen_h = 0;
+
+              pixels = malloc(SCREEN_W * SCREEN_H * 3);
+              if (!pixels)
+                  return -1;
+
+              scale = sws_getContext(
+                  frame->width, frame->height,
+                  (enum AVPixelFormat)frame->format,
+                  SCREEN_W, SCREEN_H, AV_PIX_FMT_BGR24,
+                  SWS_BILINEAR, NULL, NULL, NULL
+              );
+
+              if (!scale) {
+                  free(pixels);
+                  return -1;
+              }
+
+              dst[0] = pixels;
+              dst[1] = NULL;
+              dst[2] = NULL;
+              dst[3] = NULL;
+
+              if (sws_scale(
+                  scale,
+                  (const uint8_t * const *)frame->data,
+                  frame->linesize,
+                  0, frame->height,
+                  dst, stride
+              ) <= 0) {
+                  sws_freeContext(scale);
+                  free(pixels);
+                  return -1;
+              }
+
+              sws_freeContext(scale);
+
+              fb = gfxGetFramebuffer(
+                  GFX_TOP, GFX_LEFT, &screen_w, &screen_h
+              );
+
+              if (!fb || screen_w != SCREEN_W ||
+                  screen_h != SCREEN_H) {
+                  free(pixels);
+                  return -1;
+              }
+
+              /*
+               * 3DS framebuffers use sideways, vertically reversed
+               * pixel storage. The display format is BGR8.
+               */
+              for (int y = 0; y < SCREEN_H; y++) {
+                  for (int x = 0; x < SCREEN_W; x++) {
+                      size_t src =
+                          ((size_t)y * SCREEN_W + x) * 3;
+                      size_t dstpos =
+                          ((size_t)x * SCREEN_H +
+                           (SCREEN_H - 1 - y)) * 3;
+
+                      fb[dstpos]     = pixels[src];
+                      fb[dstpos + 1] = pixels[src + 1];
+                      fb[dstpos + 2] = pixels[src + 2];
+                  }
+              }
+
+              free(pixels);
+              return 0;
+          }
 
           int main(void)
           {
-              gfxInitDefault();
-              consoleInit(GFX_TOP, NULL);
+              AVFormatContext *fmt = NULL;
+              AVCodecContext *codec_ctx = NULL;
+              AVPacket *packet = NULL;
+              AVFrame *frame = NULL;
+              const AVCodec *decoder = NULL;
+              int video_stream = -1;
+              int result = -1;
+              int shown = 0;
 
-              AVFormatContext *format = NULL;
-              int result;
-              int video_index = -1;
-              int audio_index = -1;
+              gfxInitDefault();
+              consoleInit(GFX_BOTTOM, NULL);
 
               printf("MinimalVideoPlayer\n");
-              printf("Opening test.avi...\n\n");
+              printf("Opening test.avi...\n");
 
-              result = avformat_open_input(
-                  &format, VIDEO_PATH, NULL, NULL
+              if (avformat_open_input(
+                  &fmt, VIDEO_PATH, NULL, NULL) < 0) {
+                  printf("ERROR: cannot open %s\n", VIDEO_PATH);
+                  goto cleanup;
+              }
+
+              if (avformat_find_stream_info(fmt, NULL) < 0) {
+                  printf("ERROR: cannot read AVI streams\n");
+                  goto cleanup;
+              }
+
+              video_stream = av_find_best_stream(
+                  fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0
               );
 
-              if (result < 0) {
-                  printf("Could not open AVI.\n");
-                  printf("Check sdmc:/Movies/test.avi\n");
-                  goto exit_loop;
+              if (video_stream < 0 || !decoder) {
+                  printf("ERROR: no supported video stream\n");
+                  goto cleanup;
               }
 
-              result = avformat_find_stream_info(format, NULL);
-
-              if (result < 0) {
-                  printf("Could not read AVI streams.\n");
-                  avformat_close_input(&format);
-                  goto exit_loop;
+              codec_ctx = avcodec_alloc_context3(decoder);
+              if (!codec_ctx) {
+                  printf("ERROR: no memory for decoder\n");
+                  goto cleanup;
               }
 
-              for (unsigned int i = 0;
-                   i < format->nb_streams; i++) {
-                  enum AVMediaType type =
-                      format->streams[i]->codecpar->codec_type;
-
-                  if (type == AVMEDIA_TYPE_VIDEO)
-                      video_index = (int)i;
-
-                  if (type == AVMEDIA_TYPE_AUDIO)
-                      audio_index = (int)i;
+              if (avcodec_parameters_to_context(
+                  codec_ctx, fmt->streams[video_stream]->codecpar
+              ) < 0 || avcodec_open2(codec_ctx, decoder, NULL) < 0) {
+                  printf("ERROR: cannot initialize video decoder\n");
+                  goto cleanup;
               }
 
-              printf("AVI opened successfully.\n");
+              packet = av_packet_alloc();
+              frame = av_frame_alloc();
 
-              if (video_index >= 0) {
-                  AVCodecParameters *p =
-                      format->streams[video_index]->codecpar;
-                  const AVCodec *decoder =
-                      avcodec_find_decoder(p->codec_id);
+              if (!packet || !frame) {
+                  printf("ERROR: cannot allocate frame/packet\n");
+                  goto cleanup;
+              }
 
-                  printf("Video: %d x %d\n", p->width, p->height);
-                  printf("Video decoder: %s\n",
-                      decoder ? decoder->name : "not available");
+              printf("Decoding first frame...\n");
+
+              while (av_read_frame(fmt, packet) >= 0) {
+                  if (packet->stream_index == video_stream) {
+                      int send_result =
+                          avcodec_send_packet(codec_ctx, packet);
+
+                      if (send_result >= 0) {
+                          int receive_result =
+                              avcodec_receive_frame(codec_ctx, frame);
+
+                          if (receive_result >= 0) {
+                              result = display_frame(frame);
+                              if (result == 0)
+                                  shown = 1;
+                              av_frame_unref(frame);
+                          }
+                      }
+                  }
+
+                  av_packet_unref(packet);
+
+                  if (shown)
+                      break;
+              }
+
+              if (shown) {
+                  printf("First frame displayed!\n");
+                  printf("Press START to exit.\n");
               } else {
-                  printf("No video stream found.\n");
+                  printf("ERROR: failed to decode/display frame.\n");
               }
 
-              if (audio_index >= 0) {
-                  AVCodecParameters *p =
-                      format->streams[audio_index]->codecpar;
-                  const AVCodec *decoder =
-                      avcodec_find_decoder(p->codec_id);
+          cleanup:
+              if (packet)
+                  av_packet_free(&packet);
+              if (frame)
+                  av_frame_free(&frame);
+              if (codec_ctx)
+                  avcodec_free_context(&codec_ctx);
+              if (fmt)
+                  avformat_close_input(&fmt);
 
-                  printf("Audio decoder: %s\n",
-                      decoder ? decoder->name : "not available");
-              } else {
-                  printf("No audio stream found.\n");
-              }
-
-              avformat_close_input(&format);
-
-              printf("\nDecoder test only.\n");
-              printf("Video rendering and audio output\n");
-              printf("are not implemented yet.\n");
-
-          exit_loop:
-              printf("\nPress START to exit.");
+              gfxFlushBuffers();
+              gfxSwapBuffers();
+              gspWaitForVBlank();
 
               while (aptMainLoop()) {
                   hidScanInput();
-
                   if (hidKeysDown() & KEY_START)
                       break;
-
-                  gfxFlushBuffers();
-                  gfxSwapBuffers();
                   gspWaitForVBlank();
               }
 
               gfxExit();
-              return 0;
+              return shown ? 0 : 1;
           }
           EOF
-
-      - name: Generate standalone Makefile
-        shell: bash
-        run: |
-          set -eu
-
-          cat > Makefile <<'EOF'
-          .SUFFIXES:
-
-          ifeq ($(strip $(DEVKITARM)),)
-          $(error DEVKITARM is not configured)
-          endif
-
-          include $(DEVKITARM)/3ds_rules
-
-          TARGET := Minimalvideoplayer
-          BUILD := build
-          SOURCES := source
-          DATA :=
-          INCLUDES := library/include
-          GRAPHICS :=
-          ROMFS :=
-          ICON := icon.png
-
-          APP_TITLE := MinimalVideoPlayer
-          APP_DESCRIPTION := Autonomous AVI decoder test
-          APP_AUTHOR := ymc3013
-
-          ARCH := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
-
-          CFLAGS := -O2 -Wall -mword-relocations \
-                    -fomit-frame-pointer $(ARCH)
-          CFLAGS += $(INCLUDE) -DARM11 -D_3DS
-
-          LDFLAGS := -specs=3dsx.specs $(ARCH) \
-                     -Wl,-Map,$(notdir $*.map)
-
-          LIBDIRS := library/lib $(PORTLIBS) $(CTRULIB)
-
-          LIBS := -lavformat -lavcodec -lswscale -lswresample \
-                  -lavutil -lx264 -lmp3lame -ldav1d -lcurl \
-                  -lnghttp2 -lmbedtls -lmbedx509 -lmbedcrypto \
-                  -lctru -lz -lm
-
-          .PHONY: all clean
-
-          all: 3dsx
-
-          3dsx:
-          	$(MAKE) --no-print-directory -C $(BUILD) \
-          	  -f $(CURDIR)/Makefile
-
-          clean:
-          	rm -rf $(BUILD) $(TARGET).3dsx \
-          	  $(TARGET).smdh $(TARGET).elf
-          EOF
-
-          # Ensure the generated Makefile uses real tab characters.
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path("Makefile")
-          s = p.read_text()
-          s = s.replace(
-              "\t$(MAKE) --no-print-directory -C $(BUILD) \\\n",
-              "\t$(MAKE) --no-print-directory -C $(BUILD) \\\n"
-          )
-          p.write_text(s)
-          PY
 
       - name: Compile application
         shell: bash
@@ -273,17 +316,17 @@ jobs:
           set -eu
           make clean
           make 3dsx
+
           test -s Minimalvideoplayer.3dsx
 
           mkdir -p output
           cp Minimalvideoplayer.3dsx output/
-          test -s output/Minimalvideoplayer.3dsx
           ls -lh output/Minimalvideoplayer.3dsx
 
-      - name: Upload 3DSX
+      - name: Upload application
         uses: actions/upload-artifact@v4
         with:
-          name: Minimalvideoplayer-3DSX
+          name: Minimalvideoplayer-FirstFrame
           path: output/Minimalvideoplayer.3dsx
           if-no-files-found: error
           retention-days: 14
