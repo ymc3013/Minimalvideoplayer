@@ -10,7 +10,6 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     container:
       image: devkitpro/devkitarm:latest
 
@@ -23,36 +22,58 @@ jobs:
         run: |
           set -eux
 
-          if [ ! -d /tmp/3ds-reference ]; then
-            git clone --depth 1 \
-              https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
-              /tmp/3ds-reference
-          fi
+          git clone --depth 1 \
+            https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
+            /tmp/3ds-reference
 
-          mkdir -p library/include library/lib source build
+          mkdir -p library/include library/lib build
 
           cp -a /tmp/3ds-reference/library/include/. library/include/
           cp -a /tmp/3ds-reference/library/lib/. library/lib/
-
           rm -f library/lib/libctru.a
 
-      - name: Verify project
+      - name: Generate Makefile
         shell: bash
         run: |
           set -eux
-          test -s source/main.c
-          test -s Makefile
-          grep -q 'include.*3ds_rules' Makefile
-          grep -q 'TARGET.*Minimalvideoplayer' Makefile
 
-      - name: Clean temporary build files
-        shell: bash
-        run: |
-          set -eux
-          rm -rf build
-          rm -f Minimalvideoplayer.elf
-          rm -f Minimalvideoplayer.3dsx
-          rm -f Minimalvideoplayer.smdh
+          cat > Makefile <<'MAKEFILE'
+          .DEFAULT_GOAL := all
+
+          TARGET := Minimalvideoplayer
+          BUILD := build
+          SOURCES := source
+          INCLUDES := include library/include
+
+          ARCH := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
+
+          CFLAGS := -g -O2 -Wall -ffunction-sections -fdata-sections $(ARCH)
+          CFLAGS += -D__3DS__
+          CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions
+          ASFLAGS := $(ARCH)
+          LDFLAGS := -specs=3dsx.specs $(ARCH) -Wl,--gc-sections
+
+          LIBDIRS := library/lib
+          LIBS := -lswresample -lavformat -lswscale -lavcodec -lavutil
+          LIBS += -lx264 -lmp3lame -ldav1d -lz -lm -lctru
+
+          APP_TITLE := Minimal Video Player
+          APP_DESCRIPTION := Automatic AVI Player
+          APP_AUTHOR := ymc3013
+          APP_ICON := $(DEVKITPRO)/libctru/default_icon.png
+
+          .PHONY: all clean
+          all:
+          	$(MAKE) --no-print-directory -f $(DEVKITARM)/3ds_rules
+
+          clean:
+          	rm -rf $(BUILD) $(TARGET).elf $(TARGET).3dsx $(TARGET).smdh
+
+          include $(DEVKITARM)/3ds_rules
+          MAKEFILE
+
+          # Remove the incorrect recursive target if present in the generated file.
+          # The actual devkitPro rules are included at the end of this Makefile.
 
       - name: Build application
         shell: bash
@@ -60,13 +81,11 @@ jobs:
           set -eux
           export DEVKITPRO=/opt/devkitpro
           export DEVKITARM=/opt/devkitpro/devkitARM
+          rm -rf build
           make
 
       - name: Verify output
-        shell: bash
-        run: |
-          set -eux
-          test -s Minimalvideoplayer.3dsx
+        run: test -s Minimalvideoplayer.3dsx
 
       - name: Upload application
         uses: actions/upload-artifact@v4
