@@ -1,9 +1,11 @@
+
 name: Build Minimalvideoplayer
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -11,78 +13,28 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: devkitpro/devkitarm:latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout custom repository
         uses: actions/checkout@v4
 
-      - name: Prepare external dependencies
-        shell: bash
+      - name: Download video player source
         run: |
-          set -eux
-          # Récupération des bibliothèques de référence (headers et libs statiques)
-          git clone --depth 1 https://github.com/Core-2-Extreme/Video_player_for_3DS.git /tmp/reference
+          git clone --depth 1 \
+            https://github.com/Core-2-Extreme/Video_player_for_3DS.git \
+            upstream
 
-          mkdir -p library/include library/lib build
-          cp -a /tmp/reference/library/include/. library/include/
-          cp -a /tmp/reference/library/lib/. library/lib/
-          
-          # On supprime libctru.a obsolète pour utiliser la version du container devkitPro
-          rm -f library/lib/libctru.a
-
-      - name: Generate Makefile
-        shell: bash
+      - name: Compile 3DSX
         run: |
-          set -eux
-          cat > Makefile <<'EOF'
-          # Global Config
-          TARGET := Minimalvideoplayer
-          BUILD := build
-          SOURCES := source
-          INCLUDES := include library/include
-          LIBDIRS := library/lib
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/upstream:/work" \
+            -w /work \
+            devkitpro/devkitarm:latest \
+            bash -lc 'make 3dsx'
 
-          # Architecture flags
-          ARCH := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
-
-          # Compilation & Linking flags
-          CFLAGS := -g -O2 -Wall -ffunction-sections -fdata-sections $(ARCH) -D__3DS__
-          CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions
-          ASFLAGS := $(ARCH)
-          LDFLAGS := -specs=3dsx.specs $(ARCH) -Wl,--gc-sections
-
-          # Libraries
-          LIBS := -lswresample -lavformat -lswscale -lavcodec -lavutil
-          LIBS += -lx264 -lmp3lame -ldav1d -lz -lm -lctru
-
-          # App details
-          APP_TITLE := Minimal Video Player
-          APP_DESCRIPTION := Automatic AVI Player
-          APP_AUTHOR := ymc3013
-
-          # Rules
-          include $(DEVKITARM)/base_tools
-          include $(DEVKITARM)/3ds_rules
-          EOF
-
-      - name: Build project
-        shell: bash
-        run: |
-          set -eux
-          export DEVKITPRO=/opt/devkitpro
-          export DEVKITARM=/opt/devkitpro/devkitARM
-          rm -rf build
-          make
-
-      - name: Verify output build
-        shell: bash
-        run: test -s Minimalvideoplayer.3dsx
-
-      - name: Upload 3DSX artifact
+      - name: Upload 3DSX
         uses: actions/upload-artifact@v4
         with:
-          name: Minimalvideoplayer-3DS
-          path: Minimalvideoplayer.3dsx
+          name: Minimalvideoplayer-3DSX
+          path: upstream/*.3dsx
           if-no-files-found: error
