@@ -45,7 +45,7 @@
 #define FB_W  240            /* framebuffer "width" = physical screen height */
 
 #define ACH          0
-#define ABUFS        8
+#define ABUFS        16
 #define ABUF_SAMPLES 16384   /* max samples per NDSP buffer (stereo S16 => 4 bytes/sample) */
 #define LATE_DROP    0.150   /* seconds */
 
@@ -61,8 +61,18 @@ typedef struct {
     int         rate;
 } Audio;
 
+/* thread-safe FIFO of demuxed packets (LightLock-protected) */
+typedef struct {
+    AVPacket **q;
+    int        cap, head, tail, count;
+    size_t     bytes;
+    size_t     max_bytes;
+    LightLock  lock;
+} PQ;
+
 typedef struct {
     AVFormatContext *fmt;
+    int       vi, ai;                /* stream indexes */
     AVCodecContext  *vctx, *actx;
     AVStream        *vst, *ast;
     AVFrame         *vframe, *aframe;
@@ -83,9 +93,9 @@ typedef struct {
     Audio     au;
     int16_t  *tmp;              /* converted samples */
     int       tmp_cap;          /* in samples (per channel) */
-    bool      has_audio;
+    volatile bool has_audio;
     bool      ndsp_ok;
-    bool      aud_ready;
+    volatile bool aud_ready;
     double    audio_base;       /* pts (s) of first audio frame */
 
     /* fallback wall clock */
@@ -95,7 +105,16 @@ typedef struct {
     bool      have_vbase;
 
     bool      paused;
-    bool      quit;
+    volatile bool quit;
+
+    /* pipeline: reader thread -> packet queues -> audio thread / main (video) thread */
+    PQ        vq, aq;
+    Thread    th_reader, th_audio;
+    volatile bool go;                /* prebuffer finished: playback may start */
+    volatile bool eof;               /* reader reached end of file */
+    volatile bool audio_done;
+    int       dropped, shown, underruns;
+    bool      skipping;              /* decoder skip_frame active (catching up) */
 } Ctx;
 
 /* ------------------------------------------------------------------ logging / diagnostics */
@@ -228,11 +247,9 @@ static bool audio_push(Ctx *c, const int16_t *src, int n)
     Audio *a = &c->au;
     while (n > 0) {
         ndspWaveBuf *wb = &a->wb[a->next];
-        int waited = 0;
         while (wb->status == NDSP_WBUF_QUEUED || wb->status == NDSP_WBUF_PLAYING) {
-            svcSleepThread(1000000LL);                 /* 1 ms */
-            if (++waited > 2000) return false;         /* 2 s: give up */
-            if (!poll_input(c)) return false;
+            if (c->quit) return false;
+            svcSleepThread(2000000LL);                 /* 2 ms; also fine while paused */
         }
         int chunk = n > ABUF_SAMPLES ? ABUF_SAMPLES : n;
         int16_t *dst = (int16_t *)wb->data_vaddr;
@@ -322,8 +339,8 @@ static void handle_audio(Ctx *c, AVPacket *pkt)
         av_frame_unref(f);
         if (n <= 0) continue;
         if (c->ndsp_ok) {
-            if (!audio_push(c, c->tmp, n)) { c->quit = c->quit || !aptMainLoop(); return; }
-            c->aud_ready = true;
+            if (!audio_push(c, c->tmp, n)) return;
+            if (!c->aud_ready) { __sync_synchronize(); c->aud_ready = true; }
         }
     }
 }
@@ -415,9 +432,14 @@ static void video_present(Ctx *c, const AVFrame *f, double pts)
             if (!poll_input(c)) return;
             if (++waited > 500) break;          /* never stall forever on a stuck clock */
         }
-        if (master_clock(c) - pts > LATE_DROP) return;   /* too late: skip rendering */
+        double late = master_clock(c) - pts;
+        /* far behind: ask the decoder to skip non-reference frames until caught up */
+        if (late > 0.30 && !c->skipping)       { c->vctx->skip_frame = AVDISCARD_NONREF; c->skipping = true; }
+        else if (late < 0.05 && c->skipping)   { c->vctx->skip_frame = AVDISCARD_DEFAULT; c->skipping = false; }
+        if (late > LATE_DROP) { c->dropped++; return; }   /* too late: skip rendering */
     }
     video_render(c, f);
+    c->shown++;
 }
 
 static void handle_video(Ctx *c, AVPacket *pkt)
@@ -607,6 +629,131 @@ static bool open_media(Ctx *c, const char *path)
     return true;
 }
 
+/* ------------------------------------------------------------------ packet queues + threads */
+
+static bool pq_init(PQ *p, int cap, size_t max_bytes)
+{
+    memset(p, 0, sizeof(*p));
+    p->q = (AVPacket **)calloc((size_t)cap, sizeof(AVPacket *));
+    if (!p->q) return false;
+    p->cap = cap;
+    p->max_bytes = max_bytes;
+    LightLock_Init(&p->lock);
+    return true;
+}
+
+static bool pq_full(PQ *p)
+{
+    LightLock_Lock(&p->lock);
+    bool f = p->count >= p->cap || p->bytes >= p->max_bytes;
+    LightLock_Unlock(&p->lock);
+    return f;
+}
+
+static int pq_count(PQ *p)
+{
+    LightLock_Lock(&p->lock);
+    int n = p->count;
+    LightLock_Unlock(&p->lock);
+    return n;
+}
+
+static size_t pq_bytes(PQ *p)
+{
+    LightLock_Lock(&p->lock);
+    size_t b = p->bytes;
+    LightLock_Unlock(&p->lock);
+    return b;
+}
+
+/* takes ownership of the packet's data (src is left empty) */
+static bool pq_push(PQ *p, AVPacket *src)
+{
+    AVPacket *n = av_packet_alloc();
+    if (!n) return false;
+    av_packet_move_ref(n, src);
+    LightLock_Lock(&p->lock);
+    if (p->count >= p->cap) {
+        LightLock_Unlock(&p->lock);
+        av_packet_free(&n);
+        return false;
+    }
+    p->q[p->tail] = n;
+    p->tail = (p->tail + 1) % p->cap;
+    p->count++;
+    p->bytes += (size_t)n->size;
+    LightLock_Unlock(&p->lock);
+    return true;
+}
+
+static AVPacket *pq_pop(PQ *p)
+{
+    LightLock_Lock(&p->lock);
+    if (p->count == 0) { LightLock_Unlock(&p->lock); return NULL; }
+    AVPacket *n = p->q[p->head];
+    p->head = (p->head + 1) % p->cap;
+    p->count--;
+    p->bytes -= (size_t)n->size;
+    LightLock_Unlock(&p->lock);
+    return n;
+}
+
+static void pq_free(PQ *p)
+{
+    if (!p->q) return;
+    AVPacket *n;
+    while ((n = pq_pop(p))) av_packet_free(&n);
+    free(p->q);
+    p->q = NULL;
+}
+
+/* demuxer: reads the file and dispatches packets; blocks only when a queue is full */
+static void reader_thread(void *arg)
+{
+    Ctx *c = (Ctx *)arg;
+    AVPacket *pkt = av_packet_alloc();
+    while (pkt && !c->quit) {
+        if (av_read_frame(c->fmt, pkt) < 0) break;
+        PQ *q = NULL;
+        if (pkt->stream_index == c->vi)                                       q = &c->vq;
+        else if (c->has_audio && c->ndsp_ok && pkt->stream_index == c->ai)    q = &c->aq;
+        if (!q) { av_packet_unref(pkt); continue; }
+        while (!c->quit && pq_full(q)) svcSleepThread(2000000LL);
+        if (c->quit) { av_packet_unref(pkt); break; }
+        if (!pq_push(q, pkt)) av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+    __sync_synchronize();
+    c->eof = true;
+}
+
+/* audio decoder + NDSP feeder, independent from video so neither starves the other */
+static void audio_thread(void *arg)
+{
+    Ctx *c = (Ctx *)arg;
+    while (!c->go && !c->quit) svcSleepThread(2000000LL);     /* wait for prebuffer */
+    while (!c->quit) {
+        AVPacket *p = pq_pop(&c->aq);
+        if (!p) {
+            bool e = c->eof;
+            p = pq_pop(&c->aq);
+            if (!p) { if (e) break; svcSleepThread(2000000LL); continue; }
+        }
+        if (c->has_audio) handle_audio(c, p);                 /* else: just drain */
+        av_packet_free(&p);
+    }
+    if (!c->quit && c->has_audio) handle_audio(c, NULL);      /* flush decoder */
+    __sync_synchronize();
+    c->audio_done = true;
+}
+
+static Thread make_thread(ThreadFunc fn, void *arg, size_t stack, int prio, int core)
+{
+    Thread t = threadCreate(fn, arg, stack, prio, core, false);
+    if (!t) t = threadCreate(fn, arg, stack, prio, 0, false);   /* fallback: app core */
+    return t;
+}
+
 /* ------------------------------------------------------------------ main */
 
 int main(void)
@@ -641,11 +788,11 @@ int main(void)
     }
     say("[3/3] streams ready, opening decoders\n");
 
-    int vi = av_find_best_stream(c.fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
-    int ai = av_find_best_stream(c.fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
-    if (vi < 0) { printf("No video stream\n"); goto wait_exit; }
+    c.vi = av_find_best_stream(c.fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    c.ai = av_find_best_stream(c.fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+    if (c.vi < 0) { say("No video stream\n"); goto wait_exit; }
 
-    c.vst  = c.fmt->streams[vi];
+    c.vst  = c.fmt->streams[c.vi];
     c.vctx = open_decoder(c.vst);
     if (!c.vctx) { printf("Video decoder unavailable: %s\n",
                           avcodec_get_name(c.vst->codecpar->codec_id)); goto wait_exit; }
@@ -653,8 +800,8 @@ int main(void)
     AVRational fr = av_guess_frame_rate(c.fmt, c.vst, NULL);
     c.frame_dur = (fr.num > 0 && fr.den > 0) ? (double)fr.den / fr.num : 1.0 / 25.0;
 
-    if (ai >= 0) {
-        c.ast  = c.fmt->streams[ai];
+    if (c.ai >= 0) {
+        c.ast  = c.fmt->streams[c.ai];
         c.actx = open_decoder(c.ast);
         if (!c.actx) printf("Audio decoder unavailable: %s (playing muted)\n",
                             avcodec_get_name(c.ast->codecpar->codec_id));
@@ -676,15 +823,97 @@ int main(void)
     c.pkt    = av_packet_alloc();
     if (!c.vframe || !c.aframe || !c.pkt) { printf("Out of memory\n"); goto wait_exit; }
 
-    while (!c.quit && av_read_frame(c.fmt, c.pkt) >= 0) {
-        if (!poll_input(&c)) { av_packet_unref(c.pkt); break; }
-        if (c.pkt->stream_index == vi)                     handle_video(&c, c.pkt);
-        else if (c.has_audio && c.pkt->stream_index == ai) handle_audio(&c, c.pkt);
-        av_packet_unref(c.pkt);
+    if (!pq_init(&c.vq, 1024, 4u << 20) || !pq_init(&c.aq, 4096, 1536u << 10)) {
+        say("Out of memory (packet queues)\n");
+        goto wait_exit;
     }
+
+    {   /* worker threads: New 3DS family -> core 2; Old 3DS -> syscore (core 1, 30% allowed) */
+        s32 prio = 0x30;
+        svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+        prio -= 1;
+        if (prio < 0x19) prio = 0x19;
+        bool n3ds = false;
+        APT_CheckNew3DS(&n3ds);
+        if (!n3ds) APT_SetAppCpuTimeLimit(30);
+        int core = n3ds ? 2 : 1;
+        c.th_reader = make_thread(reader_thread, &c, 128 * 1024, prio, core);
+        if (c.has_audio && c.ndsp_ok)
+            c.th_audio = make_thread(audio_thread, &c, 256 * 1024, prio, core);
+        if (!c.th_reader || (c.has_audio && c.ndsp_ok && !c.th_audio)) {
+            say("threadCreate failed (cannot run pipeline)\n");
+            goto wait_exit;
+        }
+        say("threads started (%s, core %d)\n", n3ds ? "New 3DS" : "Old 3DS", core);
+    }
+
+    /* ---- prebuffer ~1.5 s of video before starting, so playback does not stutter */
+    {
+        int pre = (int)(1.5 / c.frame_dur + 0.5);
+        if (pre < 12) pre = 12;
+        if (pre > 120) pre = 120;
+        u64 tb0 = osGetTime();
+        while (!c.quit) {
+            if (!poll_input(&c)) break;
+            int vc = pq_count(&c.vq);
+            bool vok = vc >= pre || c.eof || pq_full(&c.vq);
+            bool aok = !(c.has_audio && c.ndsp_ok) || pq_count(&c.aq) > 0 || c.eof;
+            if (vok && aok) break;
+            if (osGetTime() - tb0 > 10000) { say("prebuffer timeout (10 s)\n"); break; }
+            printf("\x1b[29;1HBuffering video %3d/%3d   ", vc, pre);
+            fflush(stdout);
+            svcSleepThread(20000000LL);
+        }
+        say("\nPrebuffered in %u ms: video %d pkts (%u KB), audio %d pkts\n",
+            (unsigned)(osGetTime() - tb0), pq_count(&c.vq), (unsigned)(pq_bytes(&c.vq) >> 10),
+            pq_count(&c.aq));
+    }
+
+    __sync_synchronize();
+    c.go = true;
+
+    if (c.has_audio && c.ndsp_ok) {          /* start video only once audio is really playing */
+        u64 ta = osGetTime();
+        while (!c.quit && !c.aud_ready && !c.audio_done && osGetTime() - ta < 3000) {
+            svcSleepThread(2000000LL);
+            poll_input(&c);
+        }
+        if (!c.aud_ready) say("audio did not start within 3 s - continuing without sync\n");
+    }
+
+    /* ---- video loop (main thread): pop, decode, wait for clock, render */
+    {
+        u64 tstat = osGetTime();
+        bool starving = false;
+        while (!c.quit) {
+            if (!poll_input(&c)) break;
+            AVPacket *p = pq_pop(&c.vq);
+            if (!p) {
+                bool e = c.eof;                    /* read BEFORE the second pop */
+                p = pq_pop(&c.vq);
+                if (!p) {
+                    if (e) break;                  /* end of stream */
+                    if (!starving) { c.underruns++; starving = true; }
+                    svcSleepThread(2000000LL);
+                    continue;
+                }
+            }
+            starving = false;
+            handle_video(&c, p);
+            av_packet_free(&p);
+
+            if (osGetTime() - tstat >= 1000) {
+                tstat = osGetTime();
+                printf("\x1b[29;1Hq V:%3d A:%3d shown:%d drop:%d starve:%d   ",
+                       pq_count(&c.vq), pq_count(&c.aq), c.shown, c.dropped, c.underruns);
+                fflush(stdout);
+            }
+        }
+    }
+
     if (!c.quit) {                                         /* flush decoders at EOF */
         handle_video(&c, NULL);
-        if (c.has_audio) handle_audio(&c, NULL);
+        while (!c.quit && c.th_audio && !c.audio_done) { svcSleepThread(2000000LL); poll_input(&c); }
         /* let queued audio finish */
         for (int i = 0; i < 3000 && !c.quit && c.ndsp_ok && c.aud_ready; i++) {
             bool busy = false;
@@ -695,16 +924,22 @@ int main(void)
             svcSleepThread(1000000LL);
             poll_input(&c);
         }
-        printf("End of file. START to exit\n");
+        say("\nEnd of file. shown=%d dropped=%d starved=%d times. START to exit\n",
+            c.shown, c.dropped, c.underruns);
     }
 
 wait_exit:
-    while (aptMainLoop()) {
+    while (!c.quit && aptMainLoop()) {
         hidScanInput();
         if (hidKeysDown() & KEY_START) break;
         gspWaitForVBlank();
     }
 
+    c.quit = true;                                         /* make sure workers stop */
+    if (c.th_audio)  { threadJoin(c.th_audio,  U64_MAX); threadFree(c.th_audio);  c.th_audio  = NULL; }
+    if (c.th_reader) { threadJoin(c.th_reader, U64_MAX); threadFree(c.th_reader); c.th_reader = NULL; }
+    pq_free(&c.vq);
+    pq_free(&c.aq);
     if (c.ndsp_ok) { ndspChnWaveBufClear(ACH); ndspExit(); }
     if (c.au.mem) linearFree(c.au.mem);
     free(c.tmp);
