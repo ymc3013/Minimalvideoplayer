@@ -28,8 +28,7 @@ CFLAGS := -O2 -Wall -mword-relocations -ffunction-sections $(ARCH)
 CFLAGS += -D__3DS__ -U__STRICT_ANSI__ -std=gnu11
 CFLAGS += $(foreach dir,$(INCLUDES),-I$(dir))
 
-# Add explicit system library search directories (devkitPro)
-# This helps the linker find libctru.a, libcitro2d.a, libcitro3d.a and libz.a
+# Explicit system library directories from devkitPro
 SYSTEM_LIBDIRS := \
 	-L$(DEVKITPRO)/libctru/lib \
 	-L$(DEVKITPRO)/citro2d/lib \
@@ -38,7 +37,7 @@ SYSTEM_LIBDIRS := \
 
 LDFLAGS := -specs=3dsx.specs $(ARCH) -Wl,--gc-sections
 
-# Bibliothèques principales du décodeur.
+# FFmpeg libraries bundled in the project
 DECODER_LIBS := \
 	$(DECODER_LIBDIR)/libswresample.a \
 	$(DECODER_LIBDIR)/libavformat.a \
@@ -46,7 +45,7 @@ DECODER_LIBS := \
 	$(DECODER_LIBDIR)/libavcodec.a \
 	$(DECODER_LIBDIR)/libavutil.a
 
-# Bibliothèques complémentaires fournies par le projet.
+# Extra codec / network libs bundled in the project
 EXTRA_LIBS := \
 	$(DECODER_LIBDIR)/libx264.a \
 	$(DECODER_LIBDIR)/libmp3lame.a \
@@ -57,9 +56,7 @@ EXTRA_LIBS := \
 	$(DECODER_LIBDIR)/libmbedx509.a \
 	$(DECODER_LIBDIR)/libmbedcrypto.a
 
-# Bibliothèques du SDK devkitPro.
-# Nous ajoutons explicitement des -L vers les répertoires système (SYSTEM_LIBDIRS)
-# pour forcer l'utilisation des bibliothèques installées via dkp-pacman.
+# System libs from the devkitPro SDK
 SYSTEM_LIBS := -lcitro2d -lcitro3d -lctru -lm -lc -lz
 
 CFILES := $(notdir $(wildcard $(SOURCES)/*.c))
@@ -76,7 +73,13 @@ check-libs:
 	@set -e; \
 	for lib in $(DECODER_LIBS) $(EXTRA_LIBS); do \
 		if [ ! -f "$$lib" ]; then \
-			echo "ERREUR : bibliothèque manquante : $$lib"; \
+			echo "ERROR: missing library $$lib"; \
+			exit 1; \
+		fi; \
+	done; \
+	for dir in "$(DEVKITPRO)/libctru/lib" "$(DEVKITPRO)/citro2d/lib" "$(DEVKITPRO)/citro3d/lib" "$(DEVKITPRO)/libz/lib"; do \
+		if [ ! -d "$$dir" ]; then \
+			echo "ERROR: missing directory $$dir"; \
 			exit 1; \
 		fi; \
 	done
