@@ -12,12 +12,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install devkitPro pacman
+      - name: Add devkitPro APT repository (without apt-key)
         run: |
-          sudo tee /etc/apt/sources.list.d/devkitpro.list > /dev/null <<'EOF'
-          deb https://apt.devkitpro.org stable main
-          EOF
-          wget -qO- https://apt.devkitpro.org/devkitpro-keyring.gpg | sudo apt-key add -
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl gnupg
+          # Download the devkitPro key and store it as a dearmored keyring
+          curl -fsSL https://apt.devkitpro.org/devkitpro-keyring.gpg | gpg --dearmor | sudo tee /usr/share/keyrings/devkitpro-archive-keyring.gpg > /dev/null
+          # Add the repo and reference the keyring with signed-by
+          echo "deb [signed-by=/usr/share/keyrings/devkitpro-archive-keyring.gpg] https://apt.devkitpro.org stable main" | sudo tee /etc/apt/sources.list.d/devkitpro.list
           sudo apt-get update
           sudo apt-get install -y devkitpro-pacman
 
@@ -39,7 +42,6 @@ jobs:
           set -eu
           export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
 
-          # ajustez les flags make si nécessaire
           make clean
           make -j2 V=1
 
