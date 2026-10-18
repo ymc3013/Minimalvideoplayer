@@ -1,10 +1,4 @@
-ifeq ($(strip $(DEVKITPRO)),)
-$(error DEVKITPRO is not set)
-endif
-
-ifeq ($(strip $(DEVKITARM)),)
-$(error DEVKITARM is not set)
-endif
+.DEFAULT_GOAL := all
 
 TARGET      := Minimalvideoplayer
 BUILD       := build
@@ -14,7 +8,7 @@ LIBDIRS     := library/lib
 
 ARCH        := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 
-CFLAGS      := -g -O2 -Wall -mword-relocations -ffunction-sections -fdata-sections $(ARCH)
+CFLAGS      := -g -O2 -Wall -ffunction-sections -fdata-sections $(ARCH)
 CFLAGS      += -D__3DS__
 CXXFLAGS    := $(CFLAGS) -fno-rtti -fno-exceptions
 ASFLAGS     := $(ARCH)
@@ -26,5 +20,6 @@ LIBS        += -lx264 -lmp3lame -ldav1d -lz -lm -lctru
 APP_TITLE       := Minimal Video Player
 APP_DESCRIPTION := Automatic AVI Player
 APP_AUTHOR      := ymc3013
+APP_ICON        := $(DEVKITPRO)/libctru/default_icon.png
 
-include $(DEVKITARM)/3ds_rules
+include $(DEVKITPRO)/devkitARM/3ds_rules
